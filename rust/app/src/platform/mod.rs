@@ -9,8 +9,10 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(windows, feature = "portable"))]
+pub(crate) mod portable_locale;
 #[cfg(unix)]
-mod unix;
+pub(crate) mod unix;
 #[cfg(windows)]
 mod windows;
 
@@ -203,6 +205,16 @@ pub fn private_mode(o: &mut OpenOptions) -> &mut OpenOptions {
 /// Raises the soft limit on open files to the hard limit (a no-op on Windows).
 pub fn raise_open_files_limit() {
     backend::raise_open_files_limit();
+}
+
+/// `setenv(name, value, 1)`.
+pub fn setenv(name: &str, value: &[u8]) {
+    backend::setenv(name, value);
+}
+
+/// `unsetenv(name)`.
+pub fn unsetenv(name: &str) {
+    backend::unsetenv(name);
 }
 
 #[cfg(test)]

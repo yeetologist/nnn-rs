@@ -2,6 +2,9 @@
 # Differential check of the W3 functions: the C oracle (nnn.c's own functions) against the
 # Rust oracle, on generated calls, under several locales and time zones.
 #   rust/oracle/run.sh <rust-oracle-binary> [seed] [calls-per-run]
+# LOCALES overrides the locale list: the portable backend (--features portable,oracles) reproduces
+# glibc's C.UTF-8 only, so it is proven with
+#   LOCALES=C.UTF-8 rust/oracle/run.sh <oracle built with --features portable,oracles>
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 rs=$(realpath "$1")
@@ -9,7 +12,7 @@ seed=${2:-1}
 n=${3:-20000}
 "$here/build.sh"
 fail=0
-for loc in C C.UTF-8 en_US.UTF-8 tr_TR.UTF-8 de_DE.UTF-8; do
+for loc in ${LOCALES:-C C.UTF-8 en_US.UTF-8 tr_TR.UTF-8 de_DE.UTF-8}; do
   for tz in UTC America/New_York Asia/Kolkata; do
     work=$(mktemp -d /tmp/nnn-oracle.XXXXXX)
     python3 "$here/gen.py" "$seed" "$n" "$work/fx" > "$work/in"

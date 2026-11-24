@@ -52,15 +52,24 @@ required-features = ["oracles"]
 [features]
 # The oracle binaries compare modules with the C original (rust/oracle); build them with --features oracles.
 oracles = []
+# The pure-Rust locale backend (platform/portable_locale.rs): glibc C.UTF-8 behaviour without libc.
+# Windows always uses it; on Unix the default is glibc (ADR-014).
+portable = ["dep:unicode-width", "dep:regex", "dep:chrono"]
 
 [dependencies]
 signal-hook = "0.4.6"
+unicode-width = { version = "0.2", optional = true }
+regex = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 rustix = { version = "1.1.6", features = ["event", "fs", "process", "stdio", "termios"] }
 
 [target.'cfg(windows)'.dependencies]
+unicode-width = "0.2"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
 
 [workspace]
