@@ -160,10 +160,44 @@ fn shell_escape(inbuf: &[u8], buflen: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// The selection list an editor left (the part of `editselection` after the read): the
-/// last byte (the closing '\n') becomes the NUL, every '\n' before a '/' separates two
-/// paths. Returns the buffer and the number of paths.
+/// Append `s` as a POSIX single-quoted word (`'...'`), escaping every interior `'` as `'\''`.
+pub(crate) fn push_sh_single_quoted(dst: &mut Vec<u8>, s: &[u8]) {
+    dst.push(b'\'');
+    for &b in s {
+        if b == b'\'' {
+            dst.extend_from_slice(b"'\\''");
+        } else {
+            dst.push(b);
+        }
+    }
+    dst.push(b'\'');
+}
+
+/// Whether `s` starts with an absolute path prefix (`/` on Unix, `X:/`, `X:\`, or `\\` on Windows).
+fn is_abs_path_start(s: &[u8]) -> bool {
+    matches!(s.first(), Some(b'/'))
+        || (s.len() >= 3
+            && s[0].is_ascii_alphabetic()
+            && s[1] == b':'
+            && matches!(s[2], b'/' | b'\\'))
+        || s.starts_with(b"\\\\")
+}
+
+/// The selection list an editor left (the part of `editselection` after the read): strips
+/// `\r` before `\n`, turns the closing `\n` into NUL, and splits paths on every `\n` before
+/// an absolute path prefix. Returns the buffer and the number of paths.
 fn parse_edited_sel(mut buf: Vec<u8>) -> (Vec<u8>, i32) {
+    if buf.contains(&b'\r') {
+        let mut w = 0;
+        for r in 0..buf.len() {
+            if buf[r] == b'\r' && buf.get(r + 1) == Some(&b'\n') {
+                continue;
+            }
+            buf[w] = buf[r];
+            w += 1;
+        }
+        buf.truncate(w);
+    }
     let mut lines = 0;
     let Some(last) = buf.len().checked_sub(1) else {
         return (buf, 0);
@@ -172,7 +206,7 @@ fn parse_edited_sel(mut buf: Vec<u8>) -> (Vec<u8>, i32) {
     buf[last] = 0;
     for count in (1..last).rev() {
         // Replace every '\n' that separates two paths
-        if buf[count] == b'\n' && buf[count + 1] == b'/' {
+        if buf[count] == b'\n' && is_abs_path_start(&buf[count + 1..]) {
             lines += 1;
             buf[count] = 0;
         }
@@ -186,9 +220,8 @@ fn parse_edited_sel(mut buf: Vec<u8>) -> (Vec<u8>, i32) {
 pub fn opstr(op: &[u8], selpath: &[u8]) -> Vec<u8> {
     let mut v = b"xargs -0 sh -c '".to_vec();
     v.extend_from_slice(op);
-    v.extend_from_slice(b" \"$0\" \"$@\" . < /dev/tty' < '");
-    v.extend_from_slice(cstr(selpath));
-    v.push(b'\'');
+    v.extend_from_slice(b" \"$0\" \"$@\" . < /dev/tty' < ");
+    push_sh_single_quoted(&mut v, cstr(selpath));
     cmdbuf(v)
 }
 
@@ -198,22 +231,20 @@ fn rmmulcmd(r: u8, trashcmd: Option<&[u8]>, selpath: &[u8]) -> Vec<u8> {
     if let Some(t) = trashcmd {
         v = b"xargs -0 ".to_vec();
         v.extend_from_slice(cstr(t));
-        v.extend_from_slice(b" < '");
+        v.extend_from_slice(b" < ");
     } else {
         v = b"xargs -0 sh -c 'rm -".to_vec();
         v.push(r);
-        v.extend_from_slice(b"vr -- \"$0\" \"$@\" < /dev/tty' < '");
+        v.extend_from_slice(b"vr -- \"$0\" \"$@\" < /dev/tty' < ");
     }
-    v.extend_from_slice(cstr(selpath));
-    v.push(b'\'');
+    push_sh_single_quoted(&mut v, cstr(selpath));
     cmdbuf(v)
 }
 
 /// `patterns[P_CPMVFMT]` with the temp file.
 pub fn p_cpmvfmt(tmp: &[u8]) -> Vec<u8> {
-    let mut v = format!("{SED} -i 's|^\\(\\(.*/\\)\\(.*\\)$\\)|#\\1\\n\\3|' '").into_bytes();
-    v.extend_from_slice(tmp);
-    v.push(b'\'');
+    let mut v = format!("{SED} -i 's|^\\(\\(.*/\\)\\(.*\\)$\\)|#\\1\\n\\3|' ").into_bytes();
+    push_sh_single_quoted(&mut v, tmp);
     v
 }
 
@@ -221,9 +252,9 @@ pub fn p_cpmvfmt(tmp: &[u8]) -> Vec<u8> {
 pub fn p_cpmvrnm(path_esc: &[u8], tmp: &[u8], cmd: &[u8]) -> Vec<u8> {
     let mut v = format!("{SED} 's|^\\([^#/][^/]\\?.*\\)$|").into_bytes();
     v.extend_from_slice(path_esc);
-    v.extend_from_slice(b"/\\1|;s|^#\\(/.*\\)$|\\1|' '");
-    v.extend_from_slice(tmp);
-    v.extend_from_slice(b"' | tr '\\n' '\\0' | xargs -0 -n2 sh -c '");
+    v.extend_from_slice(b"/\\1|;s|^#\\(/.*\\)$|\\1|' ");
+    push_sh_single_quoted(&mut v, tmp);
+    v.extend_from_slice(b" | tr '\\n' '\\0' | xargs -0 -n2 sh -c '");
     v.extend_from_slice(cmd);
     v.extend_from_slice(b" \"$0\" \"$@\" < /dev/tty'");
     v
@@ -231,16 +262,25 @@ pub fn p_cpmvrnm(path_esc: &[u8], tmp: &[u8], cmd: &[u8]) -> Vec<u8> {
 
 /// `batch_rename`'s `batchrenamecmd` with the two temp files.
 fn batchrenamecmd(foriginal: &[u8], tmp: &[u8]) -> Vec<u8> {
-    let mut v = b"paste -d'\n' '".to_vec();
-    v.extend_from_slice(foriginal);
-    v.extend_from_slice(b"' '");
-    v.extend_from_slice(tmp);
-    v.extend_from_slice(b"' | ");
+    let mut v = b"paste -d'\n' ".to_vec();
+    push_sh_single_quoted(&mut v, foriginal);
+    v.push(b' ');
+    push_sh_single_quoted(&mut v, tmp);
+    v.extend_from_slice(b" | ");
     v.extend_from_slice(SED.as_bytes());
     v.extend_from_slice(
         b" 'N; /^\\(.*\\)\\n\\1$/!p;d' | tr '\n' '\\0' | xargs -0 -n2 sh -c 'mv -i -- \"$0\" \"$@\" < /dev/tty'",
     );
     v
+}
+
+/// Removes a temporary file on drop so early returns cannot leak it.
+struct TempGuard(Vec<u8>);
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(path(&self.0));
+    }
 }
 
 impl Nnn {
@@ -339,30 +379,24 @@ impl Nnn {
                 return 1;
             }
 
+            let prev_len = self.pselbuf.len();
             if allowemptysel {
                 self.selbufrealloc(st_size);
-            } else if st_size > self.pselbuf.len() {
-                // edited buffer larger than previous
+            } else if st_size
+                > prev_len.saturating_add(usize::try_from(self.nselected).unwrap_or(0))
+            {
+                // edited buffer larger than previous (allowing at most one '\r' per line)
                 self.rmtmpfile(&tmp);
                 break 'emptyedit;
             }
 
-            // read(fd, pselbuf, selbuflen)
-            let selbuflen = self.pselbuf.capacity().max(st_size);
-            let mut buf = vec![0u8; selbuflen];
-            let count = loop {
-                match f.read(&mut buf) {
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    r => break r,
-                }
-            };
-            let Ok(count) = count else {
+            let mut buf = Vec::with_capacity(st_size);
+            if f.read_to_end(&mut buf).is_err() {
                 self.printwarn(None);
                 drop(f);
                 self.rmtmpfile(&tmp);
                 break 'emptyedit;
-            };
-            buf.truncate(count);
+            }
 
             drop(f);
             if std::fs::remove_file(path(&tmp)).is_err() {
@@ -370,19 +404,18 @@ impl Nnn {
                 break 'emptyedit;
             }
 
-            if count == 0 {
+            if buf.is_empty() {
                 ret = 1;
                 break 'emptyedit;
             }
 
             self.resetselind();
             let (buf, lines) = parse_edited_sel(buf);
-            self.pselbuf = buf;
-
-            if !allowemptysel && lines > self.nselected {
-                // files added to selection
+            if !allowemptysel && (buf.len() > prev_len || lines > self.nselected) {
+                // edited buffer larger than previous or files added to selection
                 break 'emptyedit;
             }
+            self.pselbuf = buf;
 
             self.nselected = lines;
             self.writesel(self.pselbuf.len() - 1);
@@ -429,17 +462,18 @@ impl Nnn {
             self.mvcmd()
         };
 
-        let Some((mut f, tmp)) = self.create_tmp_file() else {
+        let Some((f, tmp)) = self.create_tmp_file() else {
             return false;
         };
+        let _tmp_guard = TempGuard(tmp.clone());
+        let mut f = f;
 
         // selsafe() returned TRUE for this to be called
         let count = if self.pselbuf.is_empty() {
-            let mut buf = b"tr '\\0' '\\n' < '".to_vec();
-            buf.extend_from_slice(cstr(self.selpath.as_deref().unwrap_or_default()));
-            buf.extend_from_slice(b"' > '");
-            buf.extend_from_slice(&tmp);
-            buf.push(b'\'');
+            let mut buf = b"tr '\\0' '\\n' < ".to_vec();
+            push_sh_single_quoted(&mut buf, cstr(self.selpath.as_deref().unwrap_or_default()));
+            buf.extend_from_slice(b" > ");
+            push_sh_single_quoted(&mut buf, &tmp);
             self.spawn_sh_exec(&buf);
 
             let mut n = entries_in_file(&mut f, PATH_MAX * 5, b'\n');
@@ -959,5 +993,23 @@ mod tests {
         );
         assert_eq!(shell_escape(b"a'b", 100).unwrap(), b"'a'\\''b'");
         assert!(batchrenamecmd(b"/o", b"/t").starts_with(b"paste -d'\n' '/o' '/t' | sed 'N;"));
+    }
+
+    #[test]
+    fn parse_edited_sel_handles_windows_crlf_paths() {
+        let (b, n) = parse_edited_sel(b"C:/foo/a.txt\r\nC:/foo/b.txt\r\n".to_vec());
+        assert_eq!(b, b"C:/foo/a.txt\0C:/foo/b.txt\0");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn opstr_escapes_single_quotes_in_selpath() {
+        let out = opstr(CP, b"/tmp/a'b/.selection");
+        let expected_tail = b" < '/tmp/a'\\''b/.selection'";
+        assert!(
+            out.ends_with(expected_tail),
+            "unexpected opstr: {}",
+            String::from_utf8_lossy(&out)
+        );
     }
 }

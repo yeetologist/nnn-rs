@@ -114,43 +114,69 @@ pub fn copy_to(src: &[u8], dst: &[u8]) -> io::Result<()> {
 }
 
 fn copy_entry(src: &[u8], dst: &[u8], ask: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path(src))?;
-    let existing = fs::symlink_metadata(path(dst)).ok();
-    if meta.is_dir() {
-        match existing {
-            Some(m) if m.is_dir() => {}
-            Some(_) => return Err(platform::error(Errno::Exist)),
-            None => fs::create_dir(path(dst))?,
-        }
-        for e in fs::read_dir(path(src))? {
-            let name = platform::into_bytes(e?.file_name());
-            copy_entry(&join(src, &name), &join(dst, &name), ask)?;
-        }
-        return set_mtime(dst, meta.modified()?);
+    enum Step {
+        Copy { src: Vec<u8>, dst: Vec<u8> },
+        SetMtime { dst: Vec<u8>, mtime: SystemTime },
     }
-    if let Some(m) = existing {
-        // cp: cannot overwrite directory with non-directory.
-        if m.is_dir() {
-            return Err(platform::error(Errno::Exist));
-        }
-        if !ask(base(dst)) {
-            return Ok(());
-        }
-        // A link replaces the file or link there (never a directory, refused above).
-        if meta.file_type().is_symlink() {
-            remove_all(dst)?;
+    let mut stack = vec![Step::Copy {
+        src: src.to_vec(),
+        dst: dst.to_vec(),
+    }];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::SetMtime { dst, mtime } => set_mtime(&dst, mtime)?,
+            Step::Copy { src, dst } => {
+                let meta = fs::symlink_metadata(path(&src))?;
+                let existing = fs::symlink_metadata(path(&dst)).ok();
+                if meta.is_dir() {
+                    match existing {
+                        Some(m) if m.is_dir() => {}
+                        Some(_) => return Err(platform::error(Errno::Exist)),
+                        None => fs::create_dir(path(&dst))?,
+                    }
+                    let mtime = meta.modified()?;
+                    let mut children = Vec::new();
+                    for e in fs::read_dir(path(&src))? {
+                        let name = platform::into_bytes(e?.file_name());
+                        children.push((join(&src, &name), join(&dst, &name)));
+                    }
+                    stack.push(Step::SetMtime { dst, mtime });
+                    for (csrc, cdst) in children.into_iter().rev() {
+                        stack.push(Step::Copy {
+                            src: csrc,
+                            dst: cdst,
+                        });
+                    }
+                    continue;
+                }
+                if let Some(m) = existing {
+                    // cp: cannot overwrite directory with non-directory.
+                    if m.is_dir() {
+                        return Err(platform::error(Errno::Exist));
+                    }
+                    if !ask(base(&dst)) {
+                        continue;
+                    }
+                    // A link replaces the file or link there (never a directory, refused above).
+                    if meta.file_type().is_symlink() {
+                        remove_all(&dst)?;
+                    }
+                }
+                if meta.file_type().is_symlink() {
+                    let target = platform::readlink(&src)?;
+                    platform::symlink(
+                        &target,
+                        &dst,
+                        fs::metadata(path(&src)).is_ok_and(|m| m.is_dir()),
+                    )?;
+                    continue;
+                }
+                busy_retry(|| fs::copy(path(&src), path(&dst)))?;
+                set_mtime(&dst, meta.modified()?)?;
+            }
         }
     }
-    if meta.file_type().is_symlink() {
-        let target = platform::readlink(src)?;
-        return platform::symlink(
-            &target,
-            dst,
-            fs::metadata(path(src)).is_ok_and(|m| m.is_dir()),
-        );
-    }
-    busy_retry(|| fs::copy(path(src), path(dst)))?;
-    set_mtime(dst, meta.modified()?)
+    Ok(())
 }
 
 fn set_mtime(p: &[u8], t: SystemTime) -> io::Result<()> {
@@ -221,18 +247,33 @@ pub fn remove_all(p: &[u8]) -> io::Result<()> {
 /// What `rm -r p` would remove, children before their directory, each with whether it is a
 /// directory; a link is listed, never followed.
 pub fn rm_entries(p: &[u8]) -> Vec<(Vec<u8>, bool)> {
+    enum Step {
+        Visit(Vec<u8>),
+        Emit(Vec<u8>, bool),
+    }
     let mut out = Vec::new();
-    let Ok(meta) = fs::symlink_metadata(path(p)) else {
-        return out;
-    };
-    if meta.is_dir()
-        && let Ok(rd) = fs::read_dir(path(p))
-    {
-        for e in rd.flatten() {
-            out.extend(rm_entries(&join(p, &platform::into_bytes(e.file_name()))));
+    let mut stack = vec![Step::Visit(p.to_vec())];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Emit(path_bytes, is_dir) => out.push((path_bytes, is_dir)),
+            Step::Visit(cur) => {
+                let Ok(meta) = fs::symlink_metadata(path(&cur)) else {
+                    continue;
+                };
+                let is_dir = meta.is_dir();
+                stack.push(Step::Emit(cur.clone(), is_dir));
+                if is_dir && let Ok(rd) = fs::read_dir(path(&cur)) {
+                    let children: Vec<Vec<u8>> = rd
+                        .flatten()
+                        .map(|e| join(&cur, &platform::into_bytes(e.file_name())))
+                        .collect();
+                    for child in children.into_iter().rev() {
+                        stack.push(Step::Visit(child));
+                    }
+                }
+            }
         }
     }
-    out.push((p.to_vec(), meta.is_dir()));
     out
 }
 
@@ -1114,6 +1155,30 @@ mod tests {
         assert!(!w.changed());
 
         drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_entries_iterative_handles_deep_tree() {
+        let dir = scratch("deep-rm");
+        let root = dir.join("root");
+        let mut cur = root.clone();
+        for i in 0..60 {
+            cur = cur.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&cur).unwrap();
+        let entries = rm_entries(&b(&root));
+        assert_eq!(entries.len(), 61);
+        for pair in entries.windows(2) {
+            assert!(
+                pair[0].0.len() > pair[1].0.len(),
+                "expected child before parent: {:?} vs {:?}",
+                String::from_utf8_lossy(&pair[0].0),
+                String::from_utf8_lossy(&pair[1].0)
+            );
+            assert!(pair[0].1);
+        }
+        assert!(entries.last().unwrap().1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

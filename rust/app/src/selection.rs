@@ -14,16 +14,16 @@ use crate::state::{NAME_MAX, Nnn, PATH_MAX};
 use crate::sys;
 use std::cmp::Ordering;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::Write;
 
 const MSG_0_SELECTED: &[u8] = b"0 selected";
 const MSG_CUR_SEL_OPTS: &[u8] = b"'c'urrent/'s'el?";
 const MSG_SEL_MISSING: &[u8] = b"open failed";
 const MSG_RM_TMP: &[u8] = b"remove tmp file?";
 
-/// One write(2), true when all of `buf` went out (as `write(fd, buf, n) == n`).
+/// Write all of `buf`, retrying short writes and `EINTR`.
 fn write_once(f: &mut dyn Write, buf: &[u8]) -> bool {
-    matches!(f.write(buf), Ok(n) if n == buf.len())
+    f.write_all(buf).is_ok()
 }
 
 /// `memmem`.
@@ -105,11 +105,7 @@ impl Nnn {
         let err = match f {
             Ok(mut f) => match self.pselbuf.get(..buflen) {
                 None => Some(platform::error(platform::Errno::Fault)),
-                Some(buf) => match f.write(buf) {
-                    Ok(n) if n == buflen => None,
-                    Ok(_) => Some(io::Error::last_os_error()),
-                    Err(e) => Some(e),
-                },
+                Some(buf) => f.write_all(buf).err(),
             },
             Err(e) => Some(e),
         };
@@ -191,9 +187,11 @@ impl Nnn {
         if self.isselfileempty() {
             return false;
         }
-        let mut cmd = b"tr '\\0' '\\n' < '".to_vec();
-        cmd.extend_from_slice(cstr(self.selpath.as_deref().unwrap_or_default()));
-        cmd.push(b'\'');
+        let mut cmd = b"tr '\\0' '\\n' < ".to_vec();
+        crate::fileops::push_sh_single_quoted(
+            &mut cmd,
+            cstr(self.selpath.as_deref().unwrap_or_default()),
+        );
         cmd.truncate(crate::config::CMD_LEN_MAX - 1);
         self.spawn(
             crate::platform::shell_exec_prefix(),
@@ -627,5 +625,23 @@ mod tests {
         assert_eq!(out, b"/r/a\0/b\0");
         n.endselection(false);
         assert_eq!(n.pselbuf, b"/r/a\0/b\0");
+    }
+
+    #[test]
+    fn write_once_handles_short_writes() {
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(2);
+                self.0.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = ShortWriter(Vec::new());
+        assert!(write_once(&mut w, b"abcdef"));
+        assert_eq!(w.0, b"abcdef");
     }
 }

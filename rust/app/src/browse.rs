@@ -44,7 +44,7 @@ pub const ESC: i32 = 27;
 /// `CREATE_NEW_KEY`: pkey when nnn starts on a file that does not exist.
 pub const CREATE_NEW_KEY: i32 = -1;
 /// `CTX_INVALID`
-pub const CTX_INVALID: usize = 0b111;
+pub const CTX_INVALID: usize = CTX_MAX;
 /// `LARGESEL`
 const LARGESEL: i32 = 1000;
 /// `RM_RECONFIRM`
@@ -3257,5 +3257,11 @@ mod tests {
         assert!(!row1.contains('\u{fffd}'), "row1 has U+FFFD: {row1:?}");
         assert!(!row2.contains('\u{fffd}'), "row2 has U+FFFD: {row2:?}");
         assert!(!row3.contains('\u{fffd}'), "row3 has U+FFFD: {row3:?}");
+    }
+
+    #[test]
+    fn ctx_invalid_does_not_collide_with_valid_contexts() {
+        const { assert!(CTX_INVALID >= CTX_MAX) };
+        const { assert!(crate::draw::CTX_INVALID >= CTX_MAX) };
     }
 }
