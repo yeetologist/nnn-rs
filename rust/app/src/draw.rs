@@ -99,7 +99,7 @@ impl Nnn {
     }
 
     fn onscreen(&self) -> i32 {
-        self.xlines - 4
+        (self.xlines - 4).max(1)
     }
 
     /// The current context's `c_fltr` as the C buffer it is: `REGEX_MAX` bytes.
@@ -230,6 +230,9 @@ impl Nnn {
 
     /// `move_cursor_next`
     pub fn move_cursor_next(&mut self) {
+        if self.ndents <= 0 {
+            return;
+        }
         let next = (self.cur + 1) % self.ndents;
         self.move_cursor(next, false);
     }
@@ -238,13 +241,13 @@ impl Nnn {
     pub fn handle_cur_move(&mut self, sel: Action) -> bool {
         match sel {
             Action::Next => {
-                if self.cfg.rollover || self.cur != self.ndents - 1 {
+                if self.ndents > 0 && (self.cfg.rollover || self.cur != self.ndents - 1) {
                     self.move_cursor_next();
                 }
                 true
             }
             Action::Prev => {
-                if self.cfg.rollover || self.cur != 0 {
+                if self.ndents > 0 && (self.cfg.rollover || self.cur != 0) {
                     let t = (self.cur + self.ndents - 1) % self.ndents;
                     self.move_cursor(t, false);
                 }
@@ -1506,5 +1509,14 @@ mod tests {
         assert!(nnn.fcolors_mis());
         assert!(nnn.fcolor_enabled(C_EXE as usize));
         assert!(!nnn.fcolor_enabled(C_DIR as usize));
+    }
+
+    #[test]
+    fn tiny_terminal_onscreen_never_negative() {
+        let nnn = Nnn {
+            xlines: 2,
+            ..Default::default()
+        };
+        assert!(nnn.onscreen() >= 1);
     }
 }

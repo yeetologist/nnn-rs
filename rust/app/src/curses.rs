@@ -116,6 +116,7 @@ pub struct Curses {
     mouse: bool,
     last_mouse: MouseEvent,
     ended: bool,
+    clear_on_refresh: bool,
 }
 
 /// The terminal `Curses` draws on and reads keys from: `platform::Term`, or a test double.
@@ -184,14 +185,49 @@ impl Window {
         if y < 0 || x < 0 || y >= self.lines || x >= self.cols {
             return ERR;
         }
-        self.cy = y;
-        self.cx = x;
+        if self.cy != y || self.cx != x {
+            self.cy = y;
+            self.cx = x;
+            self.touched = true;
+        }
         0
+    }
+
+    fn clear_wide_overlap(&mut self, y: i32, x: i32, width: i32) {
+        if width <= 0 {
+            return;
+        }
+        if let Some(i) = self.idx(y, x)
+            && self.cells[i].ch.is_empty()
+        {
+            let mut bx = x - 1;
+            while bx >= 0 {
+                if let Some(j) = self.idx(y, bx) {
+                    let was_empty = self.cells[j].ch.is_empty();
+                    self.cells[j].ch = " ".into();
+                    if !was_empty {
+                        break;
+                    }
+                }
+                bx -= 1;
+            }
+        }
+        let mut rx = x + width;
+        while let Some(j) = self.idx(y, rx) {
+            if !self.cells[j].ch.is_empty() {
+                break;
+            }
+            self.cells[j].ch = " ".into();
+            rx += 1;
+        }
     }
 
     fn put(&mut self, ch: String, width: i32, attr: u32) -> i32 {
         if width > self.cols - self.cx {
             // A wide character that does not fit wraps; pad the rest of the line.
+            if self.cx < self.cols {
+                self.clear_wide_overlap(self.cy, self.cx, self.cols - self.cx);
+            }
             while self.cx < self.cols {
                 if let Some(i) = self.idx(self.cy, self.cx) {
                     self.cells[i] = Cell {
@@ -210,6 +246,7 @@ impl Window {
         let Some(i) = self.idx(self.cy, self.cx) else {
             return ERR;
         };
+        self.clear_wide_overlap(self.cy, self.cx, width);
         self.cells[i] = Cell { ch, attr };
         for k in 1..width {
             if let Some(j) = self.idx(self.cy, self.cx + k) {
@@ -279,9 +316,24 @@ impl Window {
                 let ch = char::from_u32(c as u32).unwrap_or('?');
                 let w = wcwidth(c);
                 if w <= 0 {
-                    // Combining characters join the previous cell.
-                    if let Some(i) = self.idx(self.cy, (self.cx - 1).max(0)) {
+                    // Combining characters join the previous base cell.
+                    if self.cx == 0 {
+                        return 0;
+                    }
+                    let mut x = self.cx - 1;
+                    while x > 0 {
+                        if let Some(i) = self.idx(self.cy, x)
+                            && !self.cells[i].ch.is_empty()
+                        {
+                            break;
+                        }
+                        x -= 1;
+                    }
+                    if let Some(i) = self.idx(self.cy, x)
+                        && !self.cells[i].ch.is_empty()
+                    {
                         self.cells[i].ch.push(ch);
+                        self.touched = true;
                     }
                     return 0;
                 }
@@ -348,6 +400,9 @@ impl Window {
 
     /// `wclrtoeol`
     pub fn clrtoeol(&mut self) {
+        if self.cx < self.cols {
+            self.clear_wide_overlap(self.cy, self.cx, self.cols - self.cx);
+        }
         let attr = self.attr & A_COLOR;
         for x in self.cx..self.cols {
             if let Some(i) = self.idx(self.cy, x) {
@@ -467,6 +522,11 @@ impl Curses {
     /// Curses on `term` (already in curses' modes), drawing to `out`.
     pub fn with_term(term: Box<dyn TermIo>, out: Box<dyn Write>) -> Curses {
         let (lines, cols) = term.size();
+        let (lines, cols) = if lines <= 0 || cols <= 0 {
+            (0, 0)
+        } else {
+            (lines, cols)
+        };
         let mut c = Curses {
             stdscr: Window::new(lines, cols, 0, 0),
             overlays: Vec::new(),
@@ -483,6 +543,7 @@ impl Curses {
             mouse: false,
             last_mouse: MouseEvent::default(),
             ended: false,
+            clear_on_refresh: false,
         };
         c.emit("\x1b[?1049h\x1b[22;0;0t\x1b[?1h\x1b=\x1b[H\x1b[2J");
         c.front = vec![Cell::default(); (lines * cols) as usize];
@@ -583,9 +644,21 @@ impl Curses {
 
     /// `refresh`: send what changed since the last refresh.
     pub fn refresh(&mut self) {
-        let cells = self.composed();
+        if self.stdscr.cols <= 0 || self.stdscr.lines <= 0 {
+            self.clear_on_refresh = false;
+            return;
+        }
+        if !self.stdscr.touched && self.overlays.is_empty() && !self.clear_on_refresh {
+            return;
+        }
+        let clear = std::mem::take(&mut self.clear_on_refresh);
+        let composed_buf = (!self.overlays.is_empty()).then(|| self.composed());
+        let cells: &[Cell] = composed_buf.as_deref().unwrap_or(&self.stdscr.cells);
         let cols = self.stdscr.cols;
-        let mut s = String::new();
+        let mut s = String::from("\x1b[?2026h");
+        if clear {
+            s.push_str("\x1b[0m\x1b[H\x1b[2J");
+        }
         let mut cur_attr = u32::MAX;
         let mut at: Option<(i32, i32)> = None;
         for (i, cell) in cells.iter().enumerate() {
@@ -621,7 +694,12 @@ impl Curses {
         }
         let (cy, cx) = (self.stdscr.cy, self.stdscr.cx);
         s.push_str(&format!("\x1b[{};{}H", cy + 1, cx + 1));
-        self.front = cells;
+        s.push_str("\x1b[?2026l");
+        if let Some(buf) = composed_buf {
+            self.front = buf;
+        } else {
+            self.front.clone_from(&self.stdscr.cells);
+        }
         self.stdscr.touched = false;
         self.emit(&s);
         let _ = self.out.flush();
@@ -636,7 +714,8 @@ impl Curses {
             };
             self.front.len()
         ];
-        self.emit("\x1b[0m\x1b[H\x1b[2J");
+        self.stdscr.touched = true;
+        self.clear_on_refresh = true;
         self.refresh();
     }
 
@@ -675,6 +754,11 @@ impl Curses {
     /// `KEY_RESIZE`: the contents are kept where they fit; everything is repainted.
     pub fn resize(&mut self) {
         let (lines, cols) = self.term.size();
+        let (lines, cols) = if lines <= 0 || cols <= 0 {
+            (0, 0)
+        } else {
+            (lines, cols)
+        };
         if (lines, cols) == (self.stdscr.lines, self.stdscr.cols) {
             return;
         }
@@ -686,8 +770,16 @@ impl Curses {
                 }
             }
         }
-        win.cy = self.stdscr.cy.min(lines - 1);
-        win.cx = self.stdscr.cx.min(cols - 1);
+        win.cy = if lines > 0 {
+            self.stdscr.cy.min(lines - 1)
+        } else {
+            0
+        };
+        win.cx = if cols > 0 {
+            self.stdscr.cx.min(cols - 1)
+        } else {
+            0
+        };
         win.attr = self.stdscr.attr;
         self.stdscr = win;
         self.front = vec![
@@ -983,5 +1075,115 @@ mod tests {
         assert_eq!((cs.lines(), cs.cols()), (30, 100));
         assert_eq!(cs.get_wch(), Some(Input::Char(i32::from(b'q'))));
         assert_eq!(cs.get_wch(), None);
+    }
+
+    struct SharedWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ResizableTerm(std::rc::Rc<std::cell::Cell<(i32, i32)>>);
+
+    impl TermIo for ResizableTerm {
+        fn size(&self) -> (i32, i32) {
+            self.0.get()
+        }
+        fn read(&mut self, _wait_ms: i32, _out: &mut Vec<u8>) -> ReadResult {
+            ReadResult::Timeout
+        }
+        fn resize_pending(&self) -> bool {
+            false
+        }
+        fn set_resize_pending(&mut self, _on: bool) {}
+        fn restore(&mut self) {}
+        fn resume(&mut self) {}
+    }
+
+    #[test]
+    fn resize_to_zero_cols_and_refresh_does_not_panic() {
+        let size = std::rc::Rc::new(std::cell::Cell::new((24, 80)));
+        let mut cs = Curses::with_term(
+            Box::new(ResizableTerm(std::rc::Rc::clone(&size))),
+            Box::new(std::io::sink()),
+        );
+        size.set((0, 0));
+        cs.resize();
+        assert_eq!((cs.lines(), cs.cols()), (0, 0));
+        assert_eq!((cs.stdscr.cy, cs.stdscr.cx), (0, 0));
+        cs.refresh();
+    }
+
+    fn init_locale() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(locale::init);
+    }
+
+    #[test]
+    fn overwrite_wide_char_halves_clears_orphan() {
+        init_locale();
+        let mut w = Window::new(2, 6, 0, 0);
+        w.mv(0, 0);
+        w.addwch('中' as i32);
+        w.mv(0, 0);
+        w.addch('a');
+        assert_eq!(w.cells[w.idx(0, 0).unwrap()].ch, "a");
+        assert_eq!(w.cells[w.idx(0, 1).unwrap()].ch, " ");
+
+        w.mv(0, 0);
+        w.addwch('中' as i32);
+        w.mv(0, 1);
+        w.addch('b');
+        assert_eq!(w.cells[w.idx(0, 0).unwrap()].ch, " ");
+        assert_eq!(w.cells[w.idx(0, 1).unwrap()].ch, "b");
+    }
+
+    #[test]
+    fn combining_mark_attaches_to_wide_base_and_ignores_col_zero() {
+        init_locale();
+        let mut w = Window::new(2, 6, 0, 0);
+        w.mv(0, 0);
+        assert_eq!(w.addwch(0x0301), 0);
+        assert_eq!(w.cells[w.idx(0, 0).unwrap()].ch, " ");
+
+        w.addwch('中' as i32);
+        assert_eq!(w.cx, 2);
+        assert_eq!(w.addwch(0x0301), 0);
+        assert_eq!(w.cells[w.idx(0, 0).unwrap()].ch, "中\u{0301}");
+        assert_eq!(w.cells[w.idx(0, 1).unwrap()].ch, "");
+    }
+
+    #[test]
+    fn refresh_noop_when_untouched_and_wraps_sync_update() {
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let term = FakeTerm {
+            script: [].into(),
+            size: (4, 10),
+            resize_pending: false,
+        };
+        let mut cs = Curses::with_term(
+            Box::new(term),
+            Box::new(SharedWriter(std::rc::Rc::clone(&buf))),
+        );
+        cs.refresh();
+        buf.borrow_mut().clear();
+
+        cs.refresh();
+        assert!(buf.borrow().is_empty(), "untouched refresh emitted bytes");
+
+        cs.stdscr.mvaddstr(0, 0, b"hi");
+        cs.refresh();
+        let out = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            out.starts_with("\x1b[?2026h"),
+            "missing sync start: {out:?}"
+        );
+        assert!(out.ends_with("\x1b[?2026l"), "missing sync end: {out:?}");
     }
 }
