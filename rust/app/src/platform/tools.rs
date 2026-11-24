@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// `PATHEXT` when unset or empty.
 const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
@@ -95,9 +96,35 @@ pub enum Layout {
 }
 
 /// A detected Coreutils for Windows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Coreutils {
     pub layout: Layout,
+    /// Multicall only: the tools `coreutils.exe --list` names, read on first use (any uutils
+    /// build is called `coreutils.exe`, and not every one has `xargs` or `stat`).
+    listed: OnceLock<Vec<String>>,
+}
+
+/// The names `coreutils --list` prints, one per line.
+pub fn parse_list(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The tools the multicall `exe` provides; none when it does not run.
+fn list_tools(exe: &Path) -> Vec<String> {
+    use std::process::{Command, Stdio};
+    match Command::new(exe)
+        .arg("--list")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => parse_list(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
 }
 
 impl Coreutils {
@@ -113,14 +140,20 @@ impl Coreutils {
                 let exe = dir.join(format!("{tool}.exe"));
                 exe.is_file().then(|| vec![exe.into_os_string()])
             }
-            Layout::Multicall(exe) => Some(vec![exe.clone().into_os_string(), tool.into()]),
+            Layout::Multicall(exe) => self
+                .listed
+                .get_or_init(|| list_tools(exe))
+                .iter()
+                .any(|t| t == tool)
+                .then(|| vec![exe.clone().into_os_string(), tool.into()]),
         }
     }
 }
 
 /// Coreutils as found on `path_var` (each directory in order: `coreutils-manager.exe` there
 /// means the installed layout, else `coreutils.exe` the multicall one), else in
-/// `<program_files>/coreutils/bin` (the winget location). Only files are checked; nothing runs.
+/// `<program_files>/coreutils/bin` (the winget location). Only files are checked; nothing runs
+/// (a multicall `coreutils.exe` is asked for its `--list` on the first `argv0`).
 pub fn detect_in(path_var: Option<&OsStr>, program_files: Option<&OsStr>) -> Option<Coreutils> {
     let at = |dir: &Path| {
         if dir.join("coreutils-manager.exe").is_file() {
@@ -136,7 +169,10 @@ pub fn detect_in(path_var: Option<&OsStr>, program_files: Option<&OsStr>) -> Opt
             .is_file()
             .then_some(Layout::Installed(bin))
     });
-    found.map(|layout| Coreutils { layout })
+    found.map(|layout| Coreutils {
+        layout,
+        listed: OnceLock::new(),
+    })
 }
 
 /// Detection is on unless `NNN_COREUTILS` is `0`.
@@ -275,10 +311,36 @@ mod tests {
         let c = detect_in(Some(&paths(&[t.join("d")])), None).unwrap();
         let exe = t.join("d").join("coreutils.exe");
         assert_eq!(c.layout, Layout::Multicall(exe.clone()));
+        c.listed.set(vec!["cp".into(), "rm".into()]).unwrap();
         assert_eq!(
             c.argv0(b"rm"),
             Some(vec![exe.into_os_string(), OsString::from("rm")])
         );
+    }
+
+    #[test]
+    fn multicall_without_listed_tool_is_none() {
+        let t = tree(&["d/coreutils.exe"]);
+        let c = detect_in(Some(&paths(&[t.join("d")])), None).unwrap();
+        c.listed.set(vec!["cp".into(), "rm".into()]).unwrap();
+        assert_eq!(c.argv0(b"xargs"), None);
+        assert_eq!(c.argv0(b"stat"), None);
+        assert!(c.argv0(b"cp").is_some());
+    }
+
+    #[test]
+    fn multicall_unrunnable_offers_nothing() {
+        let t = tree(&["d/coreutils.exe"]);
+        let c = detect_in(Some(&paths(&[t.join("d")])), None).unwrap();
+        assert_eq!(c.argv0(b"cp"), None);
+    }
+
+    #[test]
+    fn parse_list_reads_names() {
+        let l = parse_list("[\narch\ncoreutils-manager\ncp\r\nxargs\n");
+        assert!(l.iter().any(|t| t == "cp"));
+        assert!(l.iter().any(|t| t == "xargs"));
+        assert!(!l.iter().any(|t| t.is_empty()));
     }
 
     #[test]
