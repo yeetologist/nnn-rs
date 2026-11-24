@@ -458,6 +458,15 @@ pub fn shell_exec_prefix() -> &'static [u8] {
     PREFIX.get_or_init(|| shell_exec_prefix_in(std::env::var_os("PATH").as_deref()))
 }
 
+pub fn which(name: &[u8]) -> Option<Vec<u8>> {
+    super::tools::which_in(
+        name,
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("PATHEXT").as_deref(),
+    )
+    .map(|p| bytes(p.as_os_str()).into_owned())
+}
+
 pub fn has_sh() -> bool {
     shell_exec_prefix() == b"sh -c"
 }

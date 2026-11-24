@@ -13,6 +13,14 @@ use std::sync::atomic::AtomicBool;
 
 #[cfg(any(windows, feature = "portable"))]
 pub(crate) mod portable_locale;
+#[cfg_attr(
+    all(not(windows), not(test)),
+    expect(
+        dead_code,
+        reason = "the Windows backend uses it; compiled everywhere so its tests run on Linux"
+    )
+)]
+pub(crate) mod tools;
 #[cfg(unix)]
 pub(crate) mod unix;
 #[cfg(windows)]
@@ -340,6 +348,12 @@ pub fn set_pipe_nonblocking(r: &io::PipeReader, w: &io::PipeWriter) {
 /// when `sh.exe` is on `PATH`, as Git for Windows puts it; else `cmd /C`).
 pub fn shell_exec_prefix() -> &'static [u8] {
     backend::shell_exec_prefix()
+}
+
+/// The full path of program `name` found on `PATH` (`PATHEXT` applied), as `which` prints it;
+/// Windows only (Unix keeps running `which`, as the original does), `None` on Unix.
+pub fn which(name: &[u8]) -> Option<Vec<u8>> {
+    backend::which(name)
 }
 
 /// `sh` is there to run script plugins (always on Unix).

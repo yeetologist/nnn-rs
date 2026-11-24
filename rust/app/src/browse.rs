@@ -2823,8 +2823,12 @@ impl Nnn {
         false
     }
 
-    /// `getutil`: the utility is in PATH (`which` succeeds).
+    /// `getutil`: the utility is in PATH (`which` succeeds; Windows, which has no `which`,
+    /// searches PATH itself).
     pub fn getutil(&mut self, util: &[u8]) -> bool {
+        if cfg!(windows) {
+            return platform::which(util).is_some();
+        }
         self.spawn(b"which", Some(util), None, None, F_NORMAL | F_NOTRACE) == 0
     }
 
