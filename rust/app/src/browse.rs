@@ -950,6 +950,9 @@ impl Nnn {
             return 0;
         }
         self.blk_shift = self.cfg.sort.blk_shift;
+        if !self.cfg.sort.blkorder {
+            self.release_du();
+        }
         if reload {
             // We are going to reload the dir.
             self.endselection(true);
@@ -1564,6 +1567,7 @@ impl Nnn {
             self.g_state.interrupt = false;
             self.cfg.sort.apparentsz = false;
             self.cfg.sort.blkorder = false;
+            self.release_du();
             self.blk_shift = BLK_SHIFT_512;
             self.cfg.sort.blk_shift = BLK_SHIFT_512;
             b.presel = control(b'L');
@@ -2229,6 +2233,7 @@ impl Nnn {
             Action::Detail => {
                 self.cfg.sort.showdetail = !self.cfg.sort.showdetail;
                 self.cfg.sort.blkorder = false;
+                self.release_du();
                 return Flow::Top;
             }
             Action::Preview => {

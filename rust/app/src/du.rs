@@ -149,6 +149,14 @@ impl DuState {
             let _ = t.join();
         }
     }
+
+    /// Release the worker pool and the 4 MiB inode/dir bitmaps when leaving DU mode.
+    pub fn release(&mut self) {
+        self.shutdown();
+        self.shared = None;
+        self.dir_dispatched_bmp = Vec::new();
+        self.num_du_threads = 0;
+    }
 }
 
 /// `test_set_bit`: atomically mark inode `nr`; true if it was not marked yet.
@@ -239,6 +247,9 @@ fn du_walk_dir(
     tfiles: &mut u64,
     tblocks: &mut i64,
 ) {
+    if sh.interrupt.load(Ordering::Relaxed) {
+        return;
+    }
     let Ok(sb_root) = platform::stat(root, false) else {
         return;
     };
@@ -250,9 +261,15 @@ fn du_walk_dir(
         add_blocks(sh, tblocks, &sb_root);
         *tfiles += 1;
     }
+    if sh.interrupt.load(Ordering::Relaxed) {
+        return;
+    }
     let Ok(dfd) = Dir::open(root) else {
         return;
     };
+    if sh.interrupt.load(Ordering::Relaxed) {
+        return;
+    }
     let Ok(entries) = dfd.entries() else {
         return;
     };
@@ -325,14 +342,16 @@ fn du_worker_loop(sh: Arc<Shared>, core: usize) {
 
         let mut tfiles = 0u64;
         let mut tblocks = 0i64;
-        du_walk_dir(
-            &sh,
-            &task.path,
-            &task.group,
-            task.count_root,
-            &mut tfiles,
-            &mut tblocks,
-        );
+        if !sh.interrupt.load(Ordering::Relaxed) {
+            du_walk_dir(
+                &sh,
+                &task.path,
+                &task.group,
+                task.count_root,
+                &mut tfiles,
+                &mut tblocks,
+            );
+        }
 
         // Aggregate into the shared group and finalize when done
         {
@@ -385,6 +404,12 @@ impl Nnn {
     /// entry's `blocks`.
     pub fn dentfill(&mut self, path: &[u8], fill: crate::dir::FillCfg) -> Vec<Entry> {
         if !self.cfg.sort.blkorder {
+            if self.g_state.duinit
+                || self.du.shared.is_some()
+                || !self.du.dir_dispatched_bmp.is_empty()
+            {
+                self.release_du();
+            }
             return crate::dir::dentfill(path, fill);
         }
         let mut hook = DuFill {
@@ -392,6 +417,12 @@ impl Nnn {
             path_dev: 0,
         };
         crate::dir::dentfill_with(path, fill, Some(&mut hook))
+    }
+
+    /// Release DU workers and bitmaps when leaving disk-usage mode.
+    pub fn release_du(&mut self) {
+        self.du.release();
+        self.g_state.duinit = false;
     }
 
     /// `dirwalk`: queue `path` for the workers as a new group.
@@ -486,6 +517,7 @@ impl Nnn {
     pub fn dentfree_du(&mut self) {
         if self.g_state.duinit {
             self.du.shutdown();
+            self.g_state.duinit = false;
         }
     }
 }
@@ -678,5 +710,65 @@ mod tests {
         assert!(test_set_bit_dir(&mut d, 1, 2));
         assert!(!test_set_bit_dir(&mut d, 2, 1));
         assert!(test_set_bit_dir(&mut d, 0, 0xFF_FFFF));
+    }
+
+    #[test]
+    fn du_worker_stops_immediately_on_interrupt() {
+        let dir = std::env::temp_dir().join(format!(
+            "nnn_du_interrupt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), b"hello world").unwrap();
+
+        let sh = Shared {
+            queue: Mutex::new(Queue::default()),
+            work_cond: Condvar::new(),
+            du_cond: Condvar::new(),
+            counts: Mutex::new(Counts::default()),
+            ihashbmp: (0..=HASH_OCTETS).map(|_| AtomicU64::new(0)).collect(),
+            interrupt: Arc::new(AtomicBool::new(true)),
+            apparentsz: AtomicBool::new(true),
+            home: Vec::new(),
+        };
+        let group = Arc::new(Mutex::new(DuGroup::default()));
+        let mut tfiles = 0u64;
+        let mut tblocks = 0i64;
+        let path_bytes = dir.to_string_lossy().into_owned().into_bytes();
+        du_walk_dir(&sh, &path_bytes, &group, true, &mut tfiles, &mut tblocks);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(tfiles, 0);
+        assert_eq!(tblocks, 0);
+    }
+
+    #[test]
+    fn du_state_default_does_not_allocate_bitmaps() {
+        let mut du = DuState::default();
+        assert!(du.shared.is_none());
+        assert!(du.dir_dispatched_bmp.is_empty());
+        assert_eq!(du.dir_dispatched_bmp.capacity(), 0);
+
+        du.shared = Some(Arc::new(Shared {
+            queue: Mutex::new(Queue::default()),
+            work_cond: Condvar::new(),
+            du_cond: Condvar::new(),
+            counts: Mutex::new(Counts::default()),
+            ihashbmp: (0..=HASH_OCTETS).map(|_| AtomicU64::new(0)).collect(),
+            interrupt: Arc::new(AtomicBool::new(false)),
+            apparentsz: AtomicBool::new(false),
+            home: Vec::new(),
+        }));
+        du.dir_dispatched_bmp = vec![0; HASH_OCTETS + 1];
+        assert!(du.shared.is_some());
+        assert_eq!(du.dir_dispatched_bmp.len(), HASH_OCTETS + 1);
+
+        du.release();
+        assert!(du.shared.is_none());
+        assert!(du.dir_dispatched_bmp.is_empty());
+        assert_eq!(du.dir_dispatched_bmp.capacity(), 0);
     }
 }
