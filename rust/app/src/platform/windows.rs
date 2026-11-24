@@ -430,22 +430,44 @@ pub fn has_sh() -> bool {
     shell_exec_prefix() == b"sh -c"
 }
 
-/// An argument on `cmd`'s command line: as it is when it holds a quote or no blank (`""`
-/// stays an empty title for `start`), else in quotes; an empty one as `""`.
+/// A word of a command run by `cmd` on its command line: an empty one as `""`, one with a
+/// quote as it is (`""` stays an empty title for `start`), one with a blank or a character
+/// cmd acts on in quotes.
 fn cmd_arg(a: &[u8]) -> Cow<'_, [u8]> {
     if a.is_empty() {
         return Cow::Borrowed(b"\"\"");
     }
-    if a.contains(&b'"') || !a.iter().any(|&c| c == b' ' || c == b'\t') {
+    let special = |c: &u8| b" \t&|<>^()%!,;=".contains(c);
+    if a.contains(&b'"') || !a.iter().any(special) {
         return Cow::Borrowed(a);
     }
     Cow::Owned([&b"\""[..], a, b"\""].concat())
 }
 
-pub fn cmd_args(cmd: &mut Command, args: &[Vec<u8>]) {
+/// `cmd`'s command line (see `platform::command`): `words` follow `cmd`; an `added` argument
+/// right after `cmd /C` is the command line itself; any other one becomes
+/// `"%NNN_CMD_ARGn%"` with the value in the child's environment: cmd expands a variable
+/// once and never parses what it put there (inside quotes, and no file name holds a quote),
+/// and `/V:OFF` keeps `!` literal too.
+pub fn cmd_args(cmd: &mut Command, words: &[Vec<u8>], added: &[Vec<u8>]) {
     use std::os::windows::process::CommandExt;
-    for a in args {
+    let line = matches!(words, [w] if w.eq_ignore_ascii_case(b"/C"));
+    if !line && !added.is_empty() {
+        cmd.raw_arg("/V:OFF");
+    }
+    for a in words {
         cmd.raw_arg(&*os(&cmd_arg(a)));
+    }
+    for (i, a) in added.iter().enumerate() {
+        if line {
+            cmd.raw_arg(&*os(a));
+        } else if a.is_empty() {
+            cmd.raw_arg("\"\"");
+        } else {
+            let name = format!("NNN_CMD_ARG{}", i + 1);
+            cmd.env(&name, &*os(a));
+            cmd.raw_arg(format!("\"%{name}%\""));
+        }
     }
 }
 
@@ -925,10 +947,42 @@ mod tests {
         assert_eq!(&*cmd_arg(b""), br#""""#);
         assert_eq!(&*cmd_arg(b"C:/My Files/a.txt"), br#""C:/My Files/a.txt""#);
         assert_eq!(&*cmd_arg(br#"notepad "a b""#), br#"notepad "a b""#);
-        let out = super::super::command(&[b"cmd".to_vec(), b"/C".to_vec(), b"echo a  b".to_vec()])
-            .output()
-            .unwrap();
-        assert_eq!(out.stdout, b"a  b\r\n");
+        for name in ["a&b.txt", "100%x%.txt", "x^(y).txt", "p|q<r>s!t,u;v=w"] {
+            assert_eq!(&*cmd_arg(name.as_bytes()), format!("\"{name}\"").as_bytes());
+        }
+        // A command line after cmd /C is run as it is.
+        let run = |argv: &[&str], words: usize| {
+            let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
+            let out = super::super::command(&argv, words).output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run(&["cmd", "/C", "echo a&echo b"], 2), "a\r\nb\r\n");
+    }
+
+    /// A file name given to a cmd command (as to the default opener) is never parsed by cmd:
+    /// no second command runs and no variable is expanded.
+    #[test]
+    fn file_names_reach_cmd_commands_literally() {
+        let dir = std::env::temp_dir().join(format!("nnn-cmd-inject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let evil = format!("a&echo x>{}", marker.display());
+        for name in [&evil[..], "100%PATH%.txt", "x^(y)!z!.txt", "p|q<r>s"] {
+            let argv = [
+                b"cmd".to_vec(),
+                b"/C".to_vec(),
+                b"echo".to_vec(),
+                name.as_bytes().to_vec(),
+            ];
+            let out = super::super::command(&argv, 3).output().unwrap();
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                format!("\"{name}\"\r\n")
+            );
+        }
+        assert!(!marker.exists(), "a file name ran a command");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

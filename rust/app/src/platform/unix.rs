@@ -320,8 +320,16 @@ pub fn has_sh() -> bool {
     true
 }
 
-pub fn cmd_args(cmd: &mut Command, args: &[Vec<u8>]) {
-    cmd.args(args.iter().map(|a| os(a)));
+pub fn cmd_args(cmd: &mut Command, words: &[Vec<u8>], added: &[Vec<u8>]) {
+    cmd.args(words.iter().chain(added).map(|a| os(a)));
+}
+
+pub fn set_pipe_nonblocking(r: &io::PipeReader, w: &io::PipeWriter) {
+    for fd in [r.as_fd(), w.as_fd()] {
+        if let Ok(fl) = rustix::fs::fcntl_getfl(fd) {
+            let _ = rustix::fs::fcntl_setfl(fd, fl | OFlags::NONBLOCK);
+        }
+    }
 }
 
 /// The kernel's host name, without its trailing newline.

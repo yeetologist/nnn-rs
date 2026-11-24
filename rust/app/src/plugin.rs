@@ -120,6 +120,8 @@ fn read_nointr(fd: &mut dyn Read, buf: &mut [u8]) -> isize {
 /// What the forked child of run_plugin() runs: a plugin or a command through `sh -c`.
 struct ChildJob {
     argv: Vec<Vec<u8>>,
+    /// `argv[..words]` is the command, the rest what nnn adds (`platform::command`).
+    words: usize,
     confirm: bool,
 }
 
@@ -127,7 +129,7 @@ impl ChildJob {
     /// The child of run_plugin(): holds `wfd` (the FIFO's write end, if any) open while
     /// `spawn` runs the job (flag 0 or `F_MULTI` [| `F_CONFIRM`]: no curses), then closes it.
     fn run(self, wfd: Option<File>) {
-        let _ = crate::platform::command(&self.argv).status();
+        let _ = crate::platform::command(&self.argv, self.words).status();
         if self.confirm {
             let mut out = std::io::stdout();
             let _ = out.write_all(MESSAGES[MSG_ENTER]);
@@ -419,9 +421,11 @@ impl Nnn {
             let (g_buf, flags) = cmd_as_plugin_line(file, flags);
             // INFALLIBLE: the prefix is two words.
             let mut argv = parseargs(crate::platform::shell_exec_prefix()).unwrap_or_default();
+            let words = argv.len();
             argv.push(g_buf);
             ChildJob {
                 argv,
+                words,
                 confirm: flags & F_CONFIRM != 0,
             }
         } else {
@@ -441,6 +445,7 @@ impl Nnn {
                 argv.push(self.selpath.clone().unwrap_or_else(|| b"-".to_vec()));
             }
             ChildJob {
+                words: argv.len(),
                 argv,
                 confirm: false,
             }

@@ -26,7 +26,9 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
 use std::sync::mpsc;
+#[cfg(windows)]
 use std::time::Duration;
 
 // Flags of spawn() (nnn.c 267-279).
@@ -632,10 +634,11 @@ fn mkstemp(template: &[u8]) -> io::Result<(File, Vec<u8>)> {
 /// child; here the child's stdin is /dev/null. A pipe's own read end is close-on-exec.
 fn spawn_redirected(
     argv: &[Vec<u8>],
+    words: usize,
     close_stdin: bool,
     out: &impl ChildOutput,
 ) -> io::Result<Child> {
-    let mut c = platform::command(argv);
+    let mut c = platform::command(argv, words);
     if close_stdin {
         c.stdin(Stdio::null());
     }
@@ -665,7 +668,8 @@ fn waitpid(mut child: Child) {
     let _ = child.wait();
 }
 
-/// A thread that reads `r` to its end, sending each chunk read.
+/// A thread that reads `r` to its end, sending each chunk read (Windows).
+#[cfg(windows)]
 fn drain(mut r: io::PipeReader) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -682,6 +686,7 @@ fn drain(mut r: io::PipeReader) -> mpsc::Receiver<Vec<u8>> {
 
 /// Up to `max` bytes of what `drain` reads once the command has exited: all of its output,
 /// or (when a program it started keeps the pipe open) what arrives within `OUTPUT_GRACE`.
+#[cfg(windows)]
 fn collect(rx: &mpsc::Receiver<Vec<u8>>, max: usize) -> Vec<u8> {
     let mut out = Vec::new();
     while out.len() < max {
@@ -695,6 +700,7 @@ fn collect(rx: &mpsc::Receiver<Vec<u8>>, max: usize) -> Vec<u8> {
 }
 
 /// How long `collect` waits for more output from a command that has exited.
+#[cfg(windows)]
 const OUTPUT_GRACE: Duration = Duration::from_millis(100);
 
 impl Nnn {
@@ -774,6 +780,7 @@ impl Nnn {
         } else {
             vec![cstr(command).to_vec()]
         };
+        let words = argv.len();
         argv.extend([arg1, arg2, arg3].into_iter().flatten().map(<[u8]>::to_vec));
 
         if flag & F_NORMAL != 0
@@ -782,7 +789,7 @@ impl Nnn {
             cs.endwin(); // exitcurses()
         }
 
-        let mut cmd = platform::command(&argv);
+        let mut cmd = platform::command(&argv, words);
         if flag & F_NOTRACE != 0 {
             // Suppress stdout and stderr
             if flag & F_NOSTDIN != 0 {
@@ -867,6 +874,8 @@ impl Nnn {
                 Ok(p) => p,
                 Err(e) => self.popup_errexit(5493, &e),
             };
+            #[cfg(unix)]
+            platform::set_pipe_nonblocking(&r, &w);
             pipe = Some((r, w));
         }
 
@@ -874,12 +883,13 @@ impl Nnn {
         let Some(mut argv) = parseargs(command) else {
             return false;
         };
+        let words = argv.len();
         argv.extend([arg1, arg2].into_iter().flatten().map(<[u8]>::to_vec));
 
         let spawned = match (&tmp, fdout, &pipe) {
-            (Some((f, _)), _, _) => spawn_redirected(&argv, true, f),
-            (None, Some(f), _) => spawn_redirected(&argv, true, f),
-            (None, None, Some((_, w))) => spawn_redirected(&argv, false, w),
+            (Some((f, _)), _, _) => spawn_redirected(&argv, words, true, f),
+            (None, Some(f), _) => spawn_redirected(&argv, words, true, f),
+            (None, None, Some((_, w))) => spawn_redirected(&argv, words, false, w),
             // INFALLIBLE: one of the three cases set an output above.
             (None, None, None) => return false,
         };
@@ -887,12 +897,16 @@ impl Nnn {
             return false;
         };
 
-        // In parent: only the child holds the write end now, so the reader sees EOF when it
-        // is done; it reads while the child runs so a full pipe cannot stop the child.
-        let output = pipe.map(|(r, w)| {
+        // Windows has no non-blocking anonymous pipes: only the child holds the write end
+        // now, so the reader sees EOF when it is done; it reads while the child runs so a
+        // full pipe cannot stop the child.
+        #[cfg(windows)]
+        let output = pipe.take().map(|(r, w)| {
             drop(w);
             drain(r)
         });
+
+        // In parent
         waitpid(child);
 
         if let Some((f, path)) = tmp {
@@ -909,6 +923,19 @@ impl Nnn {
 
         // Case 1
         let mut ret = false;
+        #[cfg(unix)]
+        if let Some((mut r, w)) = pipe {
+            let mut buf = vec![0u8; CMD_LEN_MAX - 1];
+            if let Ok(n) = r.read(&mut buf)
+                && n > 0
+            {
+                buf.truncate(n);
+                self.popup.g_buf = buf;
+                ret = true;
+            }
+            drop(w);
+        }
+        #[cfg(windows)]
         if let Some(rx) = output {
             let buf = collect(&rx, CMD_LEN_MAX - 1);
             if !buf.is_empty() {
@@ -939,9 +966,14 @@ impl Nnn {
         arg1: Option<&[u8]>,
         arg2: Option<&[u8]>,
     ) -> Option<Vec<u8>> {
-        let (r, w) = io::pipe().ok()?;
-        // Read while the commands run, so a full pipe cannot stop them.
-        let output = drain(r);
+        #[cfg(unix)]
+        let (mut r, w) = io::pipe().ok()?;
+        #[cfg(windows)]
+        let (output, w) = {
+            // Read while the commands run, so a full (small) pipe cannot stop them.
+            let (r, w) = io::pipe().ok()?;
+            (drain(r), w)
+        };
 
         // Execute all commands sequentially, writing to the pipe
         for command in cmds.iter().rev() {
@@ -951,8 +983,9 @@ impl Nnn {
             let Some(mut argv) = parseargs(command) else {
                 continue;
             };
+            let words = argv.len();
             argv.extend([arg1, arg2].into_iter().flatten().map(<[u8]>::to_vec));
-            if let Ok(child) = spawn_redirected(&argv, false, &w) {
+            if let Ok(child) = spawn_redirected(&argv, words, false, &w) {
                 waitpid(child);
             }
         }
@@ -961,6 +994,17 @@ impl Nnn {
 
         // Read directly from the pipe into the buffer
         let mut content = Vec::with_capacity(SIZE_8KB);
+        #[cfg(unix)]
+        {
+            let mut read_buf = [0u8; SIZE_8KB];
+            while content.len() < SIZE_16MB {
+                match r.read(&mut read_buf) {
+                    Ok(n) if n > 0 => content.extend_from_slice(&read_buf[..n]),
+                    _ => break,
+                }
+            }
+        }
+        #[cfg(windows)]
         while content.len() < SIZE_16MB {
             match output.recv_timeout(OUTPUT_GRACE) {
                 Ok(chunk) => content.extend_from_slice(&chunk),

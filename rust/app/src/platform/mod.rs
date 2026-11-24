@@ -324,6 +324,12 @@ pub fn defaults() -> Defaults {
     backend::defaults()
 }
 
+/// Both ends of a pipe set to `O_NONBLOCK`.
+#[cfg(unix)]
+pub fn set_pipe_nonblocking(r: &io::PipeReader, w: &io::PipeWriter) {
+    backend::set_pipe_nonblocking(r, w);
+}
+
 /// `utils[UTIL_SH_EXEC]`, the command that runs a command line: `sh -c` (on Windows only
 /// when `sh.exe` is on `PATH`, as Git for Windows puts it; else `cmd /C`).
 pub fn shell_exec_prefix() -> &'static [u8] {
@@ -359,9 +365,13 @@ pub fn shell_command_flag(shell: &[u8]) -> &'static [u8] {
 }
 
 /// `execvp(argv[0], argv)` as a `Command` (looked up in `PATH`; each string ends at its
-/// first NUL, as a C string does); on Windows the arguments of `cmd` go on its command line
-/// as they are (quoted only when they hold a blank).
-pub fn command(argv: &[Vec<u8>]) -> std::process::Command {
+/// first NUL, as a C string does). `argv[..words]` is the command, the rest are the
+/// arguments nnn adds (file names, a command line). On Windows `cmd` parses its own command
+/// line: its words go there quoted when they hold a blank or a character cmd acts on; an
+/// added argument right after `cmd /C` is the command line to run and goes as it is; any
+/// other added argument (a file name for `cmd /C start ""`) reaches cmd only through an
+/// environment variable inside quotes, so `&|<>^()%!` in it are never acted on.
+pub fn command(argv: &[Vec<u8>], words: usize) -> std::process::Command {
     let c = |a: &[u8]| {
         a.iter()
             .position(|&b| b == 0)
@@ -371,7 +381,8 @@ pub fn command(argv: &[Vec<u8>]) -> std::process::Command {
     let argv: Vec<Vec<u8>> = argv.iter().map(|a| c(a)).collect();
     let mut cmd = std::process::Command::new(&*os(&argv[0]));
     if is_cmd(&argv[0]) {
-        backend::cmd_args(&mut cmd, &argv[1..]);
+        let words = words.clamp(1, argv.len());
+        backend::cmd_args(&mut cmd, &argv[1..words], &argv[words..]);
     } else {
         cmd.args(argv[1..].iter().map(|a| os(a)));
     }
