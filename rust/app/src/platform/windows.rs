@@ -360,8 +360,17 @@ pub fn access(path: &[u8], mode: Access) -> io::Result<()> {
     }
 }
 
+/// `mkdir`; an existing directory is `EEXIST` (Windows reports access denied for a drive
+/// such as `C:` or the root `/`, which `xmktree` meets as its first prefix).
 pub fn mkdir(path: &[u8], _mode: u32) -> io::Result<()> {
-    std::fs::create_dir(super::path(path))
+    let p = super::path(path);
+    std::fs::create_dir(&p).map_err(|e| {
+        if e.kind() != io::ErrorKind::AlreadyExists && p.is_dir() {
+            error(Errno::Exist)
+        } else {
+            e
+        }
+    })
 }
 
 // W7 Task 6: NNN_FIFO and the plugin control pipe on Windows.

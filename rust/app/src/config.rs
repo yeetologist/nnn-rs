@@ -644,6 +644,28 @@ mod tests {
         assert!(is_bad_len_or_dir(b"/a/"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn xmktree_absolute_windows_path() {
+        let base = std::env::temp_dir().join(format!("nnn-xmktree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut p = platform::bytes(base.as_os_str()).into_owned();
+        // The tree loop's first prefix is the drive ("C:"), which already exists.
+        assert!(platform::is_errno(
+            &platform::mkdir(&p[..2], 0o777).unwrap_err(),
+            Errno::Exist
+        ));
+        assert!(platform::is_errno(
+            &platform::mkdir(b"/", 0o777).unwrap_err(),
+            Errno::Exist
+        ));
+        p.extend_from_slice(b"/a/b");
+        xmktree_io(&p, true, true).unwrap();
+        assert!(base.join("a").join("b").is_dir());
+        xmktree_io(&p, true, true).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn escape() {
         assert_eq!(shell_escape(b"a'b", 100).unwrap(), b"'a'\\''b'");
