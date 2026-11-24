@@ -458,31 +458,46 @@ impl DirWatch {
             return false;
         }
         let mut buf = [0u8; EVENT_BUF_LEN];
-        let Ok(n) = rustix::io::read(&self.fd, &mut buf) else {
-            return false;
-        };
-        let field = |at: usize| -> Option<u32> {
-            buf.get(at..at + 4)
-                .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-        };
-        let mut ptr = 0usize;
-        // for (ptr; ptr + ev->len < buf + i; ptr += sizeof(*ev) + ev->len)
-        while let Some(len) = field(ptr + 12) {
-            if ptr + len as usize >= n {
-                break;
+        let mut hit = false;
+        loop {
+            match rustix::io::read(&self.fd, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let field = |at: usize| -> Option<u32> {
+                        buf.get(at..at + 4)
+                            .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+                    };
+                    let mut ptr = 0usize;
+                    while ptr + 16 <= n {
+                        let Some(len) = field(ptr + 12) else {
+                            break;
+                        };
+                        let Some(end) = ptr
+                            .checked_add(16)
+                            .and_then(|p| p.checked_add(len as usize))
+                        else {
+                            break;
+                        };
+                        if end > n {
+                            break;
+                        }
+                        let (Some(wd), Some(mask)) = (field(ptr), field(ptr + 4)) else {
+                            break;
+                        };
+                        if wd == 0 {
+                            break;
+                        }
+                        if mask & INOTIFY_MASK != 0 {
+                            hit = true;
+                        }
+                        ptr = end;
+                    }
+                }
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => break,
             }
-            let (Some(wd), Some(mask)) = (field(ptr), field(ptr + 4)) else {
-                return false;
-            };
-            if wd == 0 {
-                break;
-            }
-            if mask & INOTIFY_MASK != 0 {
-                return true;
-            }
-            ptr += 16 + len as usize;
         }
-        false
+        hit
     }
 }
 
@@ -770,4 +785,31 @@ pub fn setenv(name: &str, value: &[u8]) {
 pub fn unsetenv(name: &str) {
     // SAFETY: as for setenv.
     unsafe { std::env::remove_var(name) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_watch_drains_multiple_events_in_one_call() {
+        let dir = std::env::temp_dir().join(format!("nnn-inotify-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut w = DirWatch::new().unwrap();
+        w.watch(dir.as_os_str().as_encoded_bytes());
+        assert!(!w.changed());
+
+        // Create enough files to overflow a single EVENT_BUF_LEN (512-byte) read.
+        for i in 0..30 {
+            std::fs::write(dir.join(format!("file_{i:02}_padding_name")), b"x").unwrap();
+        }
+
+        assert!(w.changed());
+        assert!(!w.changed());
+
+        w.unwatch();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

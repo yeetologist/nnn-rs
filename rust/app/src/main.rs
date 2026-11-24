@@ -2,5 +2,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     nnn::locale::init();
-    ExitCode::from(nnn::startup::run(std::env::args_os().collect()))
+    let code = nnn::startup::run(std::env::args_os().collect());
+    nnn::platform::signal_exit_complete();
+    ExitCode::from(code)
 }

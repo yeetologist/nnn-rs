@@ -422,21 +422,53 @@ fn format_info(p: &[u8], st: &FileInfo, attrs: u32) -> Vec<u8> {
     v
 }
 
+/// A directory's modification time (`None` when it cannot be read).
+#[cfg(windows)]
+fn dir_mtime(p: &[u8]) -> Option<SystemTime> {
+    fs::metadata(path(p)).ok()?.modified().ok()
+}
+
 /// A directory's modification time and entry count (`None` when it cannot be read).
+#[cfg(not(windows))]
 fn snapshot(p: &[u8]) -> Option<(SystemTime, usize)> {
     let m = fs::metadata(path(p)).ok()?.modified().ok()?;
     Some((m, fs::read_dir(path(p)).ok()?.count()))
 }
 
-/// Polls a directory for changes: its modification time and entry count against the last
-/// look.
+#[cfg(windows)]
+enum WatchKind {
+    Native(platform::windows::NativeDirWatch),
+    Mtime {
+        path: Vec<u8>,
+        last: Option<SystemTime>,
+    },
+}
+
+/// Watches a directory for changes: on Windows via `FindFirstChangeNotificationW` (falling back
+/// to directory mtime only if the handle cannot be opened), avoiding full directory scans.
 pub struct DirWatch {
+    #[cfg(windows)]
+    kind: WatchKind,
+    #[cfg(not(windows))]
     path: Vec<u8>,
+    #[cfg(not(windows))]
     last: Option<(SystemTime, usize)>,
 }
 
 impl DirWatch {
     pub fn new(p: &[u8]) -> DirWatch {
+        #[cfg(windows)]
+        {
+            let kind = match platform::windows::NativeDirWatch::new(p) {
+                Some(native) => WatchKind::Native(native),
+                None => WatchKind::Mtime {
+                    path: p.to_vec(),
+                    last: dir_mtime(p),
+                },
+            };
+            DirWatch { kind }
+        }
+        #[cfg(not(windows))]
         DirWatch {
             path: p.to_vec(),
             last: snapshot(p),
@@ -445,10 +477,23 @@ impl DirWatch {
 
     /// The directory changed since `new` or the last call.
     pub fn changed(&mut self) -> bool {
-        let now = snapshot(&self.path);
-        let changed = now != self.last;
-        self.last = now;
-        changed
+        #[cfg(windows)]
+        match &mut self.kind {
+            WatchKind::Native(w) => w.changed(),
+            WatchKind::Mtime { path, last } => {
+                let now = dir_mtime(path);
+                let changed = now != *last;
+                *last = now;
+                changed
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let now = snapshot(&self.path);
+            let changed = now != self.last;
+            self.last = now;
+            changed
+        }
     }
 }
 
@@ -619,6 +664,7 @@ mod tests {
         assert!(!w.changed());
         std::fs::remove_file(dir.join("new")).unwrap();
         assert!(w.changed());
+        drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1044,5 +1090,30 @@ mod tests {
         assert_eq!(parent_dir(b"a/b"), b"a");
         assert_eq!(parent_dir(b"a/b/"), b"a");
         assert_eq!(parent_dir(b"/a"), b"/");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dir_watch_detects_create_rename_and_modify() {
+        let dir = scratch("watch-native");
+        let mut w = DirWatch::new(&b(&dir));
+        assert!(!w.changed());
+
+        let f1 = dir.join("one.txt");
+        let f2 = dir.join("two.txt");
+        std::fs::write(&f1, b"hello").unwrap();
+        assert!(w.changed());
+        assert!(!w.changed());
+
+        std::fs::rename(&f1, &f2).unwrap();
+        assert!(w.changed());
+        assert!(!w.changed());
+
+        std::fs::write(&f2, b"hello world, modified content").unwrap();
+        assert!(w.changed());
+        assert!(!w.changed());
+
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

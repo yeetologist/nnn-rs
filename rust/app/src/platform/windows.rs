@@ -13,12 +13,14 @@ use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_STANDARD_INFO, FileBasicInfo,
-    FileStandardInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_STANDARD_INFO, FileBasicInfo, FileStandardInfo, FindCloseChangeNotification,
+    FindFirstChangeNotificationW, FindNextChangeNotification, GetDiskFreeSpaceExW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
@@ -31,7 +33,7 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CreateEventW, DETACHED_PROCESS, INFINITE, ResetEvent, SetEvent,
-    WaitForMultipleObjects,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows_sys::core::BOOL;
 
@@ -88,12 +90,41 @@ fn wtf8_to_wide(b: &[u8]) -> Vec<u16> {
 /// passed in its `\\?\` form, which has no length limit.
 const MAX_PATH: usize = 260;
 
+/// Resolves `.` and `..` segments in an absolute Windows path before prepending `\\?\`
+/// (Windows skips path normalization on verbatim paths).
+fn normalize_verbatim_components(b: &[u8]) -> Vec<u8> {
+    let root = super::root_len_with(super::Os::Windows, b);
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for seg in b[root..].split(|&c| c == b'/' || c == b'\\') {
+        match seg {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = Vec::with_capacity(b.len());
+    out.extend_from_slice(&b[..root]);
+    if root > 0 && !out.ends_with(b"/") && !out.ends_with(b"\\") && !parts.is_empty() {
+        out.push(b'/');
+    }
+    for (i, seg) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(seg);
+    }
+    out
+}
+
 /// `C:/x` as `\\?\C:\x`, `//srv/share/x` as `\\?\UNC\srv\share\x` (the form takes
 /// `\` separators only).
 fn verbatim(b: &[u8]) -> OsString {
-    let mut v: Vec<u8> = match b.strip_prefix(b"//") {
+    let norm = normalize_verbatim_components(b);
+    let mut v: Vec<u8> = match norm.strip_prefix(b"//") {
         Some(unc) => [&b"\\\\?\\UNC\\"[..], unc].concat(),
-        None => [&b"\\\\?\\"[..], b].concat(),
+        None => [&b"\\\\?\\"[..], &norm[..]].concat(),
     };
     for c in &mut v {
         if *c == b'/' {
@@ -593,8 +624,54 @@ pub fn toggle_exec(_path: &[u8]) -> Option<u32> {
     None
 }
 
-/// The directory watch: Windows polls the directory's time and entry count
-/// (`winops::DirWatch`) where Linux reads inotify events.
+/// Native Windows directory change watcher backed by `FindFirstChangeNotificationW`.
+pub struct NativeDirWatch {
+    handle: HANDLE,
+}
+
+impl NativeDirWatch {
+    pub fn new(path: &[u8]) -> Option<NativeDirWatch> {
+        use std::os::windows::ffi::OsStrExt;
+        const FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
+            | FILE_NOTIFY_CHANGE_DIR_NAME
+            | FILE_NOTIFY_CHANGE_SIZE
+            | FILE_NOTIFY_CHANGE_LAST_WRITE;
+        let wide: Vec<u16> = os(path).encode_wide().chain(Some(0)).collect();
+        // SAFETY: wide is NUL-terminated and outlives the call.
+        let handle = unsafe { FindFirstChangeNotificationW(wide.as_ptr(), FALSE, FILTER) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        Some(NativeDirWatch { handle })
+    }
+
+    pub fn changed(&mut self) -> bool {
+        let mut hit = false;
+        // Drain any already-signaled notifications (bounded to avoid spinning on continuous writes).
+        for _ in 0..64 {
+            // SAFETY: self.handle is a live change-notification handle owned by self.
+            if unsafe { WaitForSingleObject(self.handle, 0) } != WAIT_OBJECT_0 {
+                break;
+            }
+            hit = true;
+            // SAFETY: self.handle is a live change-notification handle; re-arm it.
+            if unsafe { FindNextChangeNotification(self.handle) } == 0 {
+                break;
+            }
+        }
+        hit
+    }
+}
+
+impl Drop for NativeDirWatch {
+    fn drop(&mut self) {
+        // SAFETY: self.handle was returned by FindFirstChangeNotificationW and is closed once.
+        unsafe { FindCloseChangeNotification(self.handle) };
+    }
+}
+
+/// The directory watch: Windows watches the directory via `winops::DirWatch`
+/// (`NativeDirWatch` with mtime fallback) where Linux reads inotify events.
 pub struct DirWatch {
     watch: Option<crate::winops::DirWatch>,
 }
@@ -628,6 +705,9 @@ static CTRL_FLAGS: OnceLock<(Arc<AtomicBool>, Arc<AtomicBool>)> = OnceLock::new(
 /// The event the handler sets so `Term::read` stops waiting, as a signal ends `poll` on
 /// Unix (0 until `register_signals`).
 static WAKE: AtomicUsize = AtomicUsize::new(0);
+/// The event `signal_exit_complete` sets once main has finished tearing down, so
+/// `console_ctrl` returns immediately instead of waiting out the full `CLOSE_GRACE`.
+static EXIT_DONE: AtomicUsize = AtomicUsize::new(0);
 /// How long the handler keeps a closing console's process alive for nnn to leave curses and
 /// exit (Windows ends the process when the handler returns, and after 5 s in any case).
 const CLOSE_GRACE: Duration = Duration::from_secs(4);
@@ -635,6 +715,19 @@ const CLOSE_GRACE: Duration = Duration::from_secs(4);
 fn wake_handle() -> Option<HANDLE> {
     let h = WAKE.load(Ordering::Acquire);
     (h != 0).then_some(h as HANDLE)
+}
+
+fn exit_done_handle() -> Option<HANDLE> {
+    let h = EXIT_DONE.load(Ordering::Acquire);
+    (h != 0).then_some(h as HANDLE)
+}
+
+/// Signals `console_ctrl` that cleanup is complete so a closing console does not stall.
+pub fn signal_exit_complete() {
+    if let Some(h) = exit_done_handle() {
+        // SAFETY: h is the event register_signals created; it is never closed.
+        unsafe { SetEvent(h) };
+    }
 }
 
 /// The console's events as nnn's signals: Ctrl-C is SIGINT (sets `int`), Ctrl-Break is
@@ -656,7 +749,12 @@ extern "system" fn console_ctrl(event: u32) -> BOOL {
         unsafe { SetEvent(h) };
     }
     if closing {
-        std::thread::sleep(CLOSE_GRACE);
+        if let Some(h) = exit_done_handle() {
+            // SAFETY: h is the event register_signals created; it is never closed.
+            unsafe { WaitForSingleObject(h, CLOSE_GRACE.as_millis() as u32) };
+        } else {
+            std::thread::sleep(CLOSE_GRACE);
+        }
     }
     TRUE
 }
@@ -672,6 +770,14 @@ pub fn register_signals(
             return Err((SignalStep::Interrupt, io::Error::last_os_error()));
         }
         WAKE.store(h as usize, Ordering::Release);
+    }
+    if EXIT_DONE.load(Ordering::Acquire) == 0 {
+        // SAFETY: no attributes and no name; a manual-reset event, initially not set.
+        let h = unsafe { CreateEventW(std::ptr::null(), TRUE, FALSE, std::ptr::null()) };
+        if h.is_null() {
+            return Err((SignalStep::Interrupt, io::Error::last_os_error()));
+        }
+        EXIT_DONE.store(h as usize, Ordering::Release);
     }
     let _ = CTRL_FLAGS.set((int, term.clone()));
     // SAFETY: a null handler with FALSE turns Ctrl-C handling back on (a parent may have
@@ -1114,5 +1220,18 @@ mod tests {
     #[test]
     fn backslashes_become_slashes() {
         assert_eq!(&*bytes(OsStr::new("C:\\a\\b")), b"C:/a/b");
+    }
+
+    #[test]
+    fn verbatim_normalizes_dot_and_dotdot_on_long_paths() {
+        let pad = "x".repeat(270);
+        let input = format!("C:/{pad}/a/../b/./c");
+        assert!(input.len() >= 280);
+        let out = os(input.as_bytes());
+        let s = out.to_string_lossy();
+        assert!(s.starts_with(r"\\?\C:\"), "got {s}");
+        assert!(s.ends_with(r"\b\c"), "got {s}");
+        assert!(!s.contains(r"\..\"), "got {s}");
+        assert!(!s.contains(r"\.\"), "got {s}");
     }
 }

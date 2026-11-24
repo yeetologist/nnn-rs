@@ -24,7 +24,7 @@ pub(crate) mod tools;
 #[cfg(unix)]
 pub(crate) mod unix;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 #[cfg(unix)]
 use unix as backend;
@@ -524,6 +524,12 @@ fn term_size(ws: Option<(i32, i32)>) -> (i32, i32) {
 #[cfg(windows)]
 pub fn console_modes() -> Option<(u32, u32)> {
     backend::console_modes()
+}
+
+/// Signals the Windows console close handler that process cleanup is complete (no-op on Unix).
+pub fn signal_exit_complete() {
+    #[cfg(windows)]
+    windows::signal_exit_complete();
 }
 
 #[cfg(test)]
