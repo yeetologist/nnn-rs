@@ -14,6 +14,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      # The screen cases were recorded with /tmp on tmpfs, where a directory's
+      # size is its entry bytes (80B), not ext4's 4K block: match that here.
+      - name: /tmp on tmpfs (as recorded)
+        run: sudo mount -t tmpfs -o size=2G,mode=1777 tmpfs /tmp
       - name: Packages and locales
         run: |
           sudo apt-get update
