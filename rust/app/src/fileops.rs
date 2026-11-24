@@ -128,17 +128,6 @@ fn rmmulcmd(r: u8, trashcmd: Option<&[u8]>, selpath: &[u8]) -> Vec<u8> {
     cmdbuf(v)
 }
 
-/// `confirm_force`'s prompt for one entry, `rm -rf '<name>'?`, for the path `p`.
-#[cfg(windows)]
-fn rm_prompt(p: &[u8]) -> Vec<u8> {
-    let name = p.rsplit(|&c| c == b'/').next().unwrap_or(p);
-    let mut tail = b" '".to_vec();
-    tail.extend_from_slice(name);
-    tail.extend_from_slice(b"'?");
-    tail.truncate(279);
-    [&b"rm -rf"[..], &tail].concat()
-}
-
 /// `patterns[P_CPMVFMT]` with the temp file.
 pub fn p_cpmvfmt(tmp: &[u8]) -> Vec<u8> {
     let mut v = format!("{SED} -i 's|^\\(\\(.*/\\)\\(.*\\)$\\)|#\\1\\n\\3|' '").into_bytes();
@@ -545,13 +534,13 @@ impl Nnn {
         true
     }
 
-    /// `rm -vrf` (`force`) or `rm -vri` of one path on Windows: unless forced,
-    /// `rm -rf '<name>'?` is asked first. What `-v` reports is printed outside curses, as
-    /// the original's rm prints it. True when it was removed.
+    /// `rm -vrf` (`force`) or `rm -vri` of one path on Windows: unless forced, rm's own
+    /// questions are asked for each entry (`winops::remove_confirmed`). What `-v` reports is
+    /// printed outside curses, as the original's rm prints it. True when it was removed.
     #[cfg(windows)]
     pub(crate) fn remove_native(&mut self, p: &[u8], force: bool) -> std::io::Result<bool> {
         let entries = crate::winops::rm_entries(p);
-        let mut confirm = |p: &[u8]| crate::prompt::xconfirm(self.get_input(Some(&rm_prompt(p))));
+        let mut confirm = |q: &[u8]| crate::prompt::xconfirm(self.get_input(Some(q)));
         let done = crate::winops::remove_confirmed(p, force, &mut confirm);
         let report = crate::winops::rm_verbose(&entries);
         if !report.is_empty() {

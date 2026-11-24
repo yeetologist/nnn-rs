@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NULL_DEVICE: &[u8] = b"/dev/null";
 pub const TTY_DEVICE: &[u8] = b"/dev/tty";
+pub const TTY_OUT_DEVICE: &[u8] = b"/dev/tty";
 
 pub fn os(b: &[u8]) -> Cow<'_, OsStr> {
     Cow::Borrowed(OsStr::from_bytes(b))
@@ -83,23 +84,38 @@ impl Dir {
 
     /// The entries in directory order, without `.` and `..`.
     pub fn entries(&self) -> io::Result<Entries> {
-        Ok(Entries(rustix::fs::Dir::read_from(&self.fd)?))
+        Ok(Entries {
+            dir: rustix::fs::Dir::read_from(&self.fd)?,
+            dots: false,
+        })
+    }
+
+    /// The entries as `readdir` gives them, `.` and `..` included.
+    pub fn raw_entries(&self) -> io::Result<Entries> {
+        Ok(Entries {
+            dir: rustix::fs::Dir::read_from(&self.fd)?,
+            dots: true,
+        })
     }
 }
 
-pub struct Entries(rustix::fs::Dir);
+pub struct Entries {
+    dir: rustix::fs::Dir,
+    /// `.` and `..` are listed too.
+    dots: bool,
+}
 
 impl Iterator for Entries {
     type Item = io::Result<(Vec<u8>, DType)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let e = match self.0.next()? {
+            let e = match self.dir.next()? {
                 Ok(e) => e,
                 Err(err) => return Some(Err(err.into())),
             };
             let name = e.file_name().to_bytes();
-            if name == b"." || name == b".." {
+            if !self.dots && (name == b"." || name == b"..") {
                 continue;
             }
             let ty = match e.file_type() {
@@ -203,6 +219,7 @@ fn raw_errno(errno: Errno) -> i32 {
         Errno::Io => libc::EIO,
         Errno::Fault => libc::EFAULT,
         Errno::NxIo => libc::ENXIO,
+        Errno::NotEmpty => libc::ENOTEMPTY,
     }
 }
 

@@ -411,7 +411,7 @@ impl Nnn {
     pub fn lazy_parse_plug(&mut self) -> bool {
         if !self.g_state.plugparsed {
             self.g_state.plugparsed = true;
-            let env = std::env::var_os("NNN_PLUG").map(crate::platform::into_bytes);
+            let env = std::env::var_os("NNN_PLUG").map(std::ffi::OsString::into_encoded_bytes);
             let (ok, plug) = parsekvpair(env.as_deref());
             self.plug = plug;
             if !ok {

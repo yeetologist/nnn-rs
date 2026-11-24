@@ -235,7 +235,7 @@ pub fn parseargs(cmd: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// `xgetenv`: the variable's value when set and not empty, else `fallback`.
 pub fn xgetenv(name: &str, fallback: Option<&[u8]>) -> Option<Vec<u8>> {
     match std::env::var_os(name) {
-        Some(v) if !v.is_empty() => Some(crate::platform::into_bytes(v)),
+        Some(v) if !v.is_empty() => Some(v.into_encoded_bytes()),
         _ => fallback.map(<[u8]>::to_vec),
     }
 }
@@ -799,7 +799,10 @@ impl Nnn {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         } else if flag & F_TTY != 0 && !io::stdout().is_terminal() {
             // If stdout has been redirected to a non-tty, force output to tty
-            if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            if let Ok(tty) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(platform::path(platform::tty_out_device()))
+            {
                 cmd.stdout(Stdio::from(tty));
             }
         }

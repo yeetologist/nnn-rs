@@ -179,6 +179,11 @@ pub fn tty_device() -> &'static [u8] {
     backend::TTY_DEVICE
 }
 
+/// The terminal to write to: `/dev/tty` or `CONOUT$`.
+pub fn tty_out_device() -> &'static [u8] {
+    backend::TTY_OUT_DEVICE
+}
+
 /// The directory for temporary files, if there is one.
 pub fn temp_dir() -> Option<Vec<u8>> {
     backend::temp_dir()
@@ -234,6 +239,7 @@ pub enum Errno {
     Io,
     Fault,
     NxIo,
+    NotEmpty,
 }
 
 /// The error for `errno` (Unix: the OS's own; Windows: glibc's words, so `strerror` matches).

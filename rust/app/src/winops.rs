@@ -126,12 +126,21 @@ pub fn move_into(
         return Ok(());
     }
     match fs::rename(path(src), path(&target)) {
-        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-            copy_entry(src, &target, &mut |_| true)?;
-            remove_all(src)
-        }
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => move_by_copy(src, &target),
         r => r,
     }
+}
+
+/// `mv` across volumes: `src` is copied to `target`, then removed. A non-empty directory
+/// at `target` is refused (`ENOTEMPTY`), never merged into.
+fn move_by_copy(src: &[u8], target: &[u8]) -> io::Result<()> {
+    if fs::symlink_metadata(path(target)).is_ok_and(|m| m.is_dir())
+        && fs::read_dir(path(target))?.next().is_some()
+    {
+        return Err(platform::error(Errno::NotEmpty));
+    }
+    copy_entry(src, target, &mut |_| true)?;
+    remove_all(src)
 }
 
 /// `rm -rf path`: a directory with all it holds; a link itself, never what it points to.
@@ -185,17 +194,72 @@ pub fn rm_verbose(entries: &[(Vec<u8>, bool)]) -> Vec<u8> {
     out
 }
 
-/// `rm -ri`'s answer for one entry: unless `force`, `confirm(path)` decides first. True
-/// when `path` was removed, false when declined.
+/// `rm -rf p` (`force`) or `rm -ri p`: unless forced, `confirm(question)` decides each entry
+/// with rm's own questions (`rm: remove regular file 'p'?`). True when `p` was removed,
+/// false when it (or something in it) was kept.
 pub fn remove_confirmed(
     p: &[u8],
     force: bool,
     confirm: &mut dyn FnMut(&[u8]) -> bool,
 ) -> io::Result<bool> {
-    if !force && !confirm(p) {
+    if force {
+        return remove_all(p).map(|()| true);
+    }
+    remove_interactive(p, confirm)
+}
+
+/// `rm -ri`: a non-empty directory is asked about before going in and again before it is
+/// removed; one that keeps an entry is left without asking.
+fn remove_interactive(p: &[u8], confirm: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<bool> {
+    let meta = fs::symlink_metadata(path(p))?;
+    if !meta.is_dir() {
+        let kind = if meta.file_type().is_symlink() || is_dir_link(&meta) {
+            "symbolic link"
+        } else if meta.permissions().readonly() {
+            if meta.len() == 0 {
+                "write-protected regular empty file"
+            } else {
+                "write-protected regular file"
+            }
+        } else if meta.len() == 0 {
+            "regular empty file"
+        } else {
+            "regular file"
+        };
+        if !confirm(&rm_question(&format!("remove {kind}"), p)) {
+            return Ok(false);
+        }
+        return remove_all(p).map(|()| true);
+    }
+    let names: Vec<Vec<u8>> = fs::read_dir(path(p))?
+        .map(|e| e.map(|e| platform::into_bytes(e.file_name())))
+        .collect::<io::Result<_>>()?;
+    if !names.is_empty() {
+        if !confirm(&rm_question("descend into directory", p)) {
+            return Ok(false);
+        }
+        let mut all = true;
+        for name in names {
+            all &= remove_interactive(&join(p, &name), confirm)?;
+        }
+        if !all {
+            return Ok(false);
+        }
+    }
+    if !confirm(&rm_question("remove directory", p)) {
         return Ok(false);
     }
-    remove_all(p).map(|()| true)
+    fs::remove_dir(path(p)).map(|()| true)
+}
+
+/// `rm: <what> 'p'?`, quoted as `rm_verbose` quotes.
+fn rm_question(what: &str, p: &[u8]) -> Vec<u8> {
+    let q = if p.contains(&b'\'') { b'"' } else { b'\'' };
+    let mut v = format!("rm: {what} ").into_bytes();
+    v.push(q);
+    v.extend_from_slice(p);
+    v.extend_from_slice(&[q, b'?']);
+    v
 }
 
 /// A link to a directory (Windows removes it as a directory).
@@ -418,6 +482,33 @@ mod tests {
     }
 
     #[test]
+    fn move_by_copy_refuses_a_non_empty_target_dir() {
+        let dir = scratch("mvx");
+        std::fs::create_dir_all(dir.join("m").join("x")).unwrap();
+        std::fs::write(dir.join("m").join("f"), b"new").unwrap();
+        std::fs::create_dir_all(dir.join("d").join("m")).unwrap();
+        std::fs::write(dir.join("d").join("m").join("f"), b"old").unwrap();
+        let (src, target) = (b(&dir.join("m")), b(&dir.join("d").join("m")));
+        let e = move_by_copy(&src, &target).unwrap_err();
+        assert_eq!(crate::sys::strerror(&e), "Directory not empty");
+        assert_eq!(
+            std::fs::read(dir.join("d").join("m").join("f")).unwrap(),
+            b"old"
+        );
+        assert!(dir.join("m").join("x").is_dir());
+        // An empty target directory takes the tree, as rename(2) replaces it.
+        std::fs::remove_file(dir.join("d").join("m").join("f")).unwrap();
+        move_by_copy(&src, &target).unwrap();
+        assert!(!dir.join("m").exists());
+        assert!(dir.join("d").join("m").join("x").is_dir());
+        assert_eq!(
+            std::fs::read(dir.join("d").join("m").join("f")).unwrap(),
+            b"new"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remove_all_removes_tree() {
         let dir = scratch("rm");
         std::fs::create_dir_all(dir.join("t").join("u")).unwrap();
@@ -517,6 +608,13 @@ mod tests {
     fn file_info_lines() {
         let dir = scratch("info");
         std::fs::write(dir.join("f"), b"abc").unwrap();
+        // The mode does not depend on the umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("f"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
         let p = b(&dir.join("f"));
         let text = String::from_utf8(file_info_text(&p)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -552,10 +650,43 @@ mod tests {
             false
         };
         assert!(!remove_confirmed(&t, false, &mut no).unwrap());
-        assert_eq!(asked, std::slice::from_ref(&t));
+        let q = |s: &str| s.replace("{t}", &String::from_utf8_lossy(&t)).into_bytes();
+        assert_eq!(asked, [q("rm: descend into directory '{t}'?")]);
         assert!(dir.join("t").join("u").is_dir());
         assert!(remove_confirmed(&t, true, &mut never).unwrap());
         assert!(!dir.join("t").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_interactive_asks_per_entry_like_rm_ri() {
+        let dir = scratch("rmri");
+        std::fs::create_dir_all(dir.join("t").join("u")).unwrap();
+        std::fs::create_dir(dir.join("t").join("e")).unwrap();
+        std::fs::write(dir.join("t").join("u").join("keep"), b"x").unwrap();
+        std::fs::write(dir.join("t").join("g"), b"").unwrap();
+        let t = b(&dir.join("t"));
+        let mut asked = Vec::new();
+        let mut yes_but_keep = |p: &[u8]| {
+            asked.push(String::from_utf8_lossy(p).into_owned());
+            !p.ends_with(b"keep'?")
+        };
+        assert!(!remove_confirmed(&t, false, &mut yes_but_keep).unwrap());
+        asked.sort();
+        let ts = String::from_utf8_lossy(&t).into_owned();
+        let mut want = vec![
+            format!("rm: descend into directory '{ts}'?"),
+            format!("rm: descend into directory '{ts}/u'?"),
+            format!("rm: remove directory '{ts}/e'?"),
+            format!("rm: remove regular empty file '{ts}/g'?"),
+            format!("rm: remove regular file '{ts}/u/keep'?"),
+        ];
+        want.sort();
+        // Never the same question twice; a directory that keeps an entry is not asked about.
+        assert_eq!(asked, want);
+        assert!(dir.join("t").join("u").join("keep").exists());
+        assert!(!dir.join("t").join("g").exists());
+        assert!(!dir.join("t").join("e").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

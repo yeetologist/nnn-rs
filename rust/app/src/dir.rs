@@ -5,6 +5,8 @@ use crate::platform::{DType, Dir, FileInfo};
 use crate::sort::{
     DIR_OR_DIRLNK, Entry, FILE_MISSING, FILE_YOUNG, HARD_LINK, SYM_ORPHAN, TimeType,
 };
+use std::io;
+use std::iter::Peekable;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFLNK: u32 = 0o120000;
@@ -51,6 +53,15 @@ pub trait DuHook {
     fn finish(&mut self, ents: &mut [Entry]);
 }
 
+/// `AT_SYMLINK_NOFOLLOW` for the whole listing: with disk usage, or when the first entry
+/// `readdir` gives (usually `.`) has no `d_type`, as the original decides it.
+fn nofollow_for<I>(entries: &mut Peekable<I>, du: bool) -> bool
+where
+    I: Iterator<Item = io::Result<(Vec<u8>, DType)>>,
+{
+    du || matches!(entries.peek(), Some(Ok((_, DType::Unknown))))
+}
+
 /// `dentfill`: the entries of `path` in directory order; empty if it cannot be read.
 pub fn dentfill(path: &[u8], cfg: FillCfg) -> Vec<Entry> {
     dentfill_with(path, cfg, None)
@@ -64,9 +75,10 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
     let Ok(dir) = Dir::open(path) else {
         return Vec::new();
     };
-    let Ok(entries) = dir.entries() else {
+    let Ok(entries) = dir.raw_entries() else {
         return Vec::new();
     };
+    let mut entries = entries.peekable();
     let mut out = Vec::new();
     if let Some(h) = du.as_deref_mut()
         && !h.begin(&dir, path)
@@ -74,12 +86,10 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
         h.finish(&mut out);
         return out;
     }
-    let mut nofollow: Option<bool> = None;
+    let nofollow = nofollow_for(&mut entries, du.is_some());
     for dp in entries {
         let Ok((name, d_type)) = dp else { break };
         let name = name.as_slice();
-        // Decided on the first entry read, as the original does.
-        let nofollow = *nofollow.get_or_insert(du.is_some() || d_type == DType::Unknown);
         if selforparent(name) {
             continue;
         }
@@ -160,4 +170,38 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
         h.finish(&mut out);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listing(types: &[(&str, DType)]) -> std::vec::IntoIter<io::Result<(Vec<u8>, DType)>> {
+        let v: Vec<_> = types
+            .iter()
+            .map(|&(n, t)| Ok((n.as_bytes().to_vec(), t)))
+            .collect();
+        v.into_iter()
+    }
+
+    #[test]
+    fn nofollow_is_decided_by_the_first_raw_entry() {
+        // "." without d_type decides it, though the real entries have one.
+        let mut it = listing(&[
+            (".", DType::Unknown),
+            ("..", DType::Dir),
+            ("a", DType::Regular),
+        ])
+        .peekable();
+        assert!(nofollow_for(&mut it, false));
+        assert_eq!(it.next().unwrap().unwrap().0, b".");
+        // "." with d_type: a later entry without one does not change it.
+        let mut it =
+            listing(&[(".", DType::Dir), ("..", DType::Dir), ("b", DType::Unknown)]).peekable();
+        assert!(!nofollow_for(&mut it, false));
+        // Disk usage always lstats.
+        let mut it = listing(&[(".", DType::Dir)]).peekable();
+        assert!(nofollow_for(&mut it, true));
+        assert!(!nofollow_for(&mut listing(&[]).peekable(), false));
+    }
 }

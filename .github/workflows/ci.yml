@@ -47,6 +47,11 @@ jobs:
         run: |
           cargo clippy --manifest-path rust/app/Cargo.toml --all-targets -- -D warnings
           cargo fmt --manifest-path rust/app/Cargo.toml --check
+      - name: tui-check test, clippy and fmt
+        run: |
+          cargo test --manifest-path rust/tui-check/Cargo.toml
+          cargo clippy --manifest-path rust/tui-check/Cargo.toml --all-targets -- -D warnings
+          cargo fmt --manifest-path rust/tui-check/Cargo.toml --check
 
   windows:
     runs-on: windows-latest
@@ -68,5 +73,11 @@ jobs:
         run: cargo clippy --manifest-path rust/app/Cargo.toml --all-targets -- -D warnings
       - name: fmt
         run: cargo fmt --manifest-path rust/app/Cargo.toml --check
+      - name: tui-check cargo test
+        run: cargo test --manifest-path rust/tui-check/Cargo.toml
+      - name: tui-check clippy
+        run: cargo clippy --manifest-path rust/tui-check/Cargo.toml --all-targets -- -D warnings
+      - name: tui-check fmt
+        run: cargo fmt --manifest-path rust/tui-check/Cargo.toml --check
       - name: Screen cases via tui-check (40)
         run: cargo run --manifest-path rust/tui-check/Cargo.toml -- check "$env:GITHUB_WORKSPACE\rust\app\target\debug\nnn.exe"

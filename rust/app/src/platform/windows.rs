@@ -37,6 +37,7 @@ use windows_sys::core::BOOL;
 
 pub const NULL_DEVICE: &[u8] = b"NUL";
 pub const TTY_DEVICE: &[u8] = b"CONIN$";
+pub const TTY_OUT_DEVICE: &[u8] = b"CONOUT$";
 
 /// Decodes WTF-8 (UTF-8 that may hold unpaired surrogates) to UTF-16; a byte that is not part of
 /// a sequence becomes U+FFFD.
@@ -259,6 +260,11 @@ impl Dir {
     pub fn entries(&self) -> io::Result<Entries> {
         Ok(Entries(std::fs::read_dir(super::path(&self.path))?))
     }
+
+    /// `entries`: Windows lists no `.` and `..`.
+    pub fn raw_entries(&self) -> io::Result<Entries> {
+        self.entries()
+    }
 }
 
 pub struct Entries(std::fs::ReadDir);
@@ -363,6 +369,7 @@ pub fn error(errno: Errno) -> io::Error {
         Errno::Io => (K::Other, "Input/output error"),
         Errno::Fault => (K::Other, "Bad address"),
         Errno::NxIo => (K::Other, "No such device or address"),
+        Errno::NotEmpty => (K::DirectoryNotEmpty, "Directory not empty"),
     };
     io::Error::new(kind, text)
 }
@@ -374,6 +381,7 @@ pub fn is_errno(e: &io::Error, n: Errno) -> bool {
         Errno::Exist => e.kind() == K::AlreadyExists,
         Errno::Inval => e.kind() == K::InvalidInput,
         Errno::NameTooLong => e.kind() == K::InvalidFilename,
+        Errno::NotEmpty => e.kind() == K::DirectoryNotEmpty,
         Errno::Io | Errno::Fault | Errno::NxIo => false,
     }
 }
@@ -769,11 +777,9 @@ impl Term {
         let deadline = u64::try_from(wait_ms)
             .ok()
             .map(|ms| Instant::now() + Duration::from_millis(ms));
+        // The wake event is reset only once a wait has seen it, so a Ctrl-C that comes before
+        // the wait still ends it.
         let wake = wake_handle();
-        if let Some(h) = wake {
-            // SAFETY: h is the event register_signals created; it is never closed.
-            unsafe { ResetEvent(h) };
-        }
         let handles: Vec<HANDLE> = [Some(self.input), wake].into_iter().flatten().collect();
         loop {
             let wait = deadline.map_or(INFINITE, |d| {
@@ -785,6 +791,12 @@ impl Term {
                 WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, wait)
             };
             if r != WAIT_OBJECT_0 {
+                if r == WAIT_OBJECT_0 + 1
+                    && let Some(h) = wake
+                {
+                    // SAFETY: h is the event register_signals created; it is never closed.
+                    unsafe { ResetEvent(h) };
+                }
                 return ReadResult::Timeout;
             }
             let mut recs = [INPUT_RECORD::default(); 64];
