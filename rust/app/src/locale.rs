@@ -24,4 +24,5 @@ pub struct LocalTime {
     pub mday: i32,
     pub hour: i32,
     pub min: i32,
+    pub sec: i32,
 }

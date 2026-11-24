@@ -67,6 +67,7 @@ const STR_TMPFILE: &[u8] = b"/.nnnXXXXXX";
 /// `utils[UTIL_LOCKER]` (Linux)
 const UTIL_LOCKER: &[u8] = b"vlock";
 /// `FILE_MIME_OPTS` (Linux)
+#[cfg(unix)]
 const FILE_MIME_OPTS: &str = "-biL";
 /// `env_cfg[NNN_OPENER..=NNN_TRASH]`
 const ENV_CFG_SHOWN: [&str; 11] = [
@@ -1083,14 +1084,20 @@ impl Nnn {
     /// window; n/p there move to the next/previous entry and show it. `pathbuf` gets the
     /// entry's path.
     pub fn show_stats(&mut self, pathbuf: &mut Vec<u8>, dir: &[u8]) -> bool {
+        #[cfg(unix)]
         let mime = format!("file {FILE_MIME_OPTS}");
+        #[cfg(unix)]
         let cmds: [&[u8]; 3] = [mime.as_bytes(), b"file -b", b"stat"];
         loop {
             *pathbuf = mkpath(&self.home, dir, &self.pdents[self.cur as usize].name);
 
+            #[cfg(unix)]
             let Some(content) = self.buffer_command_output(&cmds, Some(pathbuf), None) else {
                 return false;
             };
+            // Windows has no stat or file: the entry's details come from winops.
+            #[cfg(windows)]
+            let content = crate::winops::file_info_text(pathbuf);
 
             let mut action: Option<Action> = None; // SEL_MAX
             if !self.show_content_in_floating_window(&content, Some(&mut action), true) {

@@ -26,6 +26,8 @@ fn strerror_windows(e: &io::Error) -> String {
         DirectoryNotEmpty => "Directory not empty",
         ResourceBusy => "Device or resource busy",
         InvalidFilename => "File name too long",
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION: another process holds the file.
+        _ if matches!(e.raw_os_error(), Some(32 | 33)) => "Device or resource busy",
         _ => return without_os_error(e),
     };
     text.to_string()

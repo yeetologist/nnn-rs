@@ -17,7 +17,8 @@ use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_STANDARD_INFO, FileBasicInfo,
-    FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    FileStandardInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx,
 };
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
@@ -82,7 +83,29 @@ fn wtf8_to_wide(b: &[u8]) -> Vec<u16> {
     out
 }
 
+/// `MAX_PATH`: an absolute path this long (in bytes, never fewer than its UTF-16 units) is
+/// passed in its `\\?\` form, which has no length limit.
+const MAX_PATH: usize = 260;
+
+/// `C:/x` as `\\?\C:\x`, `//srv/share/x` as `\\?\UNC\srv\share\x` (the form takes
+/// `\` separators only).
+fn verbatim(b: &[u8]) -> OsString {
+    let mut v: Vec<u8> = match b.strip_prefix(b"//") {
+        Some(unc) => [&b"\\\\?\\UNC\\"[..], unc].concat(),
+        None => [&b"\\\\?\\"[..], b].concat(),
+    };
+    for c in &mut v {
+        if *c == b'/' {
+            *c = b'\\';
+        }
+    }
+    OsString::from_wide(&wtf8_to_wide(&v))
+}
+
 pub fn os(b: &[u8]) -> Cow<'_, OsStr> {
+    if b.len() >= MAX_PATH && super::is_absolute(b) && !b.starts_with(b"//?/") {
+        return Cow::Owned(verbatim(b));
+    }
     match std::str::from_utf8(b) {
         Ok(s) => Cow::Borrowed(OsStr::new(s)),
         Err(_) => Cow::Owned(OsString::from_wide(&wtf8_to_wide(b))),
@@ -92,11 +115,12 @@ pub fn os(b: &[u8]) -> Cow<'_, OsStr> {
 pub fn bytes(s: &OsStr) -> Cow<'_, [u8]> {
     let b = s.as_encoded_bytes();
     if b.contains(&b'\\') {
-        Cow::Owned(
-            b.iter()
-                .map(|&c| if c == b'\\' { b'/' } else { c })
-                .collect(),
-        )
+        let slashed: Vec<u8> = b
+            .iter()
+            .map(|&c| if c == b'\\' { b'/' } else { c })
+            .collect();
+        // The `\\?\` form `os` gives long paths reads back as the usual one.
+        Cow::Owned(strip_verbatim(slashed))
     } else {
         Cow::Borrowed(b)
     }
@@ -514,9 +538,20 @@ pub fn wait_status(st: ExitStatus) -> i32 {
     st.code().unwrap_or(-1)
 }
 
-// W7 Task 7: free and used space on Windows.
-pub fn fs_blocks(_path: &[u8]) -> Option<FsBlocks> {
-    None
+/// Free and total space of the volume holding `path`, counted in 1-byte blocks
+/// (`get_fs_info` then shifts by nothing).
+pub fn fs_blocks(path: &[u8]) -> Option<FsBlocks> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = os(path).encode_wide().chain(Some(0)).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: wide is NUL-terminated and outlives the call; the three outputs are writable u64s.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    (ok != 0).then_some(FsBlocks {
+        frsize: 1,
+        blocks: total,
+        bfree: free,
+        bavail: avail,
+    })
 }
 
 /// Windows files have no execute bits to toggle.
@@ -524,30 +559,33 @@ pub fn toggle_exec(_path: &[u8]) -> Option<u32> {
     None
 }
 
-// W7 Task 7: dir-change polling on Windows; until then no change is reported.
+/// The directory watch: Windows polls the directory's time and entry count
+/// (`winops::DirWatch`) where Linux reads inotify events.
 pub struct DirWatch {
-    watching: bool,
+    watch: Option<crate::winops::DirWatch>,
 }
 
 impl DirWatch {
     pub fn new() -> io::Result<DirWatch> {
-        Ok(DirWatch { watching: false })
+        Ok(DirWatch { watch: None })
     }
 
-    pub fn watch(&mut self, _path: &[u8]) {
-        self.watching = true;
+    pub fn watch(&mut self, path: &[u8]) {
+        self.watch = Some(crate::winops::DirWatch::new(path));
     }
 
     pub fn unwatch(&mut self) {
-        self.watching = false;
+        self.watch = None;
     }
 
     pub fn is_watching(&self) -> bool {
-        self.watching
+        self.watch.is_some()
     }
 
     pub fn changed(&mut self) -> bool {
-        false
+        self.watch
+            .as_mut()
+            .is_some_and(crate::winops::DirWatch::changed)
     }
 }
 

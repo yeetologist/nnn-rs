@@ -19,6 +19,8 @@ const MSG_0_SELECTED: usize = 3;
 const MSG_CANCEL: usize = 4;
 const MSG_CP_MV_AS: usize = 7;
 const MSG_INVALID_KEY: usize = 40;
+#[cfg(windows)]
+const MSG_OVERWRITE: usize = 13;
 
 /// `SED` (Linux).
 const SED: &str = "sed";
@@ -124,6 +126,17 @@ fn rmmulcmd(r: u8, trashcmd: Option<&[u8]>, selpath: &[u8]) -> Vec<u8> {
     v.extend_from_slice(cstr(selpath));
     v.push(b'\'');
     cmdbuf(v)
+}
+
+/// `confirm_force`'s prompt for one entry, `rm -rf '<name>'?`, for the path `p`.
+#[cfg(windows)]
+fn rm_prompt(p: &[u8]) -> Vec<u8> {
+    let name = p.rsplit(|&c| c == b'/').next().unwrap_or(p);
+    let mut tail = b" '".to_vec();
+    tail.extend_from_slice(name);
+    tail.extend_from_slice(b"'?");
+    tail.truncate(279);
+    [&b"rm -rf"[..], &tail].concat()
 }
 
 /// `patterns[P_CPMVFMT]` with the temp file.
@@ -436,6 +449,12 @@ impl Nnn {
             return false;
         }
 
+        // Windows has no cp, mv or rm: they run here (a trash command still runs as set).
+        #[cfg(windows)]
+        if sel != Action::Cpmvas && !(sel == Action::Trash && self.trashcmd.is_some()) {
+            return self.cpmvrm_native(sel, dirpath);
+        }
+
         let g_buf = match sel {
             Action::Cp => self.opstr(self.cpcmd()),
             Action::Mv => self.opstr(self.mvcmd()),
@@ -475,6 +494,56 @@ impl Nnn {
         }
 
         // Clear selection
+        self.clearselection();
+        true
+    }
+
+    /// `cpmvrm_selection` on Windows: copy, move or remove each path of the selection file
+    /// natively, with `cp -i`'s "overwrite?" and `rm`'s confirmations. An error is shown
+    /// and the next path goes on; after one the selection stays.
+    #[cfg(windows)]
+    fn cpmvrm_native(&mut self, sel: Action, dirpath: &[u8]) -> bool {
+        use crate::prompt::xconfirm;
+        use crate::winops;
+
+        let remove = sel != Action::Cp && sel != Action::Mv;
+        let force = if remove {
+            match self.confirm_force(true, false) {
+                0 => {
+                    self.printmsg(MESSAGES[MSG_CANCEL]);
+                    return false;
+                }
+                r => r == b'f',
+            }
+        } else {
+            false
+        };
+
+        let list =
+            std::fs::read(path(self.selpath.as_deref().unwrap_or_default())).unwrap_or_default();
+        let mut failed = false;
+        for p in list.split(|&c| c == 0).filter(|p| !p.is_empty()) {
+            let done = if remove {
+                if !force && !xconfirm(self.get_input(Some(&rm_prompt(p)))) {
+                    continue;
+                }
+                winops::remove_all(p)
+            } else {
+                let mut ask = |_: &[u8]| xconfirm(self.get_input(Some(MESSAGES[MSG_OVERWRITE])));
+                if sel == Action::Cp {
+                    winops::copy_into(p, dirpath, &mut ask)
+                } else {
+                    winops::move_into(p, dirpath, &mut ask)
+                }
+            };
+            if let Err(e) = done {
+                self.printwait(crate::sys::strerror(&e).as_bytes(), None);
+                failed = true;
+            }
+        }
+        if failed {
+            return false;
+        }
         self.clearselection();
         true
     }

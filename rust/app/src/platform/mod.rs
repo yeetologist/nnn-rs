@@ -726,6 +726,33 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn long_absolute_paths_use_the_verbatim_form() {
+        let long = [&b"C:/"[..], &[b'a'; 300]].concat();
+        let o = os(&long);
+        let mut want = b"\\\\?\\C:\\".to_vec();
+        want.extend_from_slice(&[b'a'; 300]);
+        assert_eq!(o.as_encoded_bytes(), want);
+        assert_eq!(&*bytes(&o), &long[..]);
+        let unc = [&b"//srv/share/"[..], &[b'b'; 300]].concat();
+        assert!(
+            os(&unc)
+                .as_encoded_bytes()
+                .starts_with(b"\\\\?\\UNC\\srv\\share\\")
+        );
+        assert_eq!(&*bytes(&os(&unc)), &unc[..]);
+        assert_eq!(&*os(b"C:/short"), OsStr::new("C:/short"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fs_blocks_reports_the_volume() {
+        let b = fs_blocks(&bytes(std::env::temp_dir().as_os_str())).unwrap();
+        assert_eq!(b.frsize, 1);
+        assert!(b.blocks > 0 && b.bfree <= b.blocks && b.bavail <= b.bfree);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn strerror_uses_glibc_words() {
         let e = std::fs::File::open("C:/no/such/file").unwrap_err();
         assert_eq!(crate::sys::strerror(&e), "No such file or directory");

@@ -20,8 +20,7 @@ use crate::locale::Regex;
 use crate::opts::Opts;
 use crate::platform::{self, Access, Errno};
 use crate::popup::{
-    F_CHKRTN, F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, F_SILENT, xchartohex,
-    xgetenv,
+    F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, F_SILENT, xchartohex, xgetenv,
 };
 use crate::prompt::xconfirm;
 use crate::sort::{DIR_OR_DIRLNK, Entry, FILE_SELECTED, TimeType};
@@ -2894,14 +2893,22 @@ impl Nnn {
             return false;
         }
         if !use_trash {
-            let opts = [b'-', b'v', b'r', r];
-            self.spawn(
-                b"rm",
-                Some(&opts),
-                Some(b"--"),
-                Some(fpath),
-                F_NORMAL | F_CHKRTN,
-            );
+            #[cfg(unix)]
+            {
+                let opts = [b'-', b'v', b'r', r];
+                self.spawn(
+                    b"rm",
+                    Some(&opts),
+                    Some(b"--"),
+                    Some(fpath),
+                    F_NORMAL | crate::popup::F_CHKRTN,
+                );
+            }
+            // Windows has no rm: the entry is removed here.
+            #[cfg(windows)]
+            if let Err(e) = crate::winops::remove_all(fpath) {
+                self.printwait(sys::strerror(&e).as_bytes(), None);
+            }
         } else {
             let t = self.trashcmd.clone().unwrap_or_default();
             self.spawn(&t, Some(fpath), None, None, F_NORMAL | F_MULTI);

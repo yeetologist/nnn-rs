@@ -144,6 +144,7 @@ pub fn localtime(secs: i64) -> LocalTime {
         mday: t.day() as i32,
         hour: t.hour() as i32,
         min: t.minute() as i32,
+        sec: t.second() as i32,
     }
 }
 

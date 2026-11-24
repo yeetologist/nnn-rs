@@ -693,6 +693,7 @@ pub mod glibc {
             mday: tm.tm_mday,
             hour: tm.tm_hour,
             min: tm.tm_min,
+            sec: tm.tm_sec,
         }
     }
 
