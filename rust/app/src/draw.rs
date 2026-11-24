@@ -958,7 +958,7 @@ impl Nnn {
         let c = self.cfg.sort.clone();
         let (head, _) = self.pdents.split_at_mut(ndents);
         if self.cfg.fuzzy && !fltr.is_empty() {
-            head.sort_by(|a, b| c.fuzzyentrycmp(fltr, ic, a, b));
+            c.sort_fuzzy(head, fltr, ic);
         } else {
             head.sort_by(|a, b| c.cmp(a, b));
         }

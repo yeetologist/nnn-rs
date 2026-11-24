@@ -223,13 +223,15 @@ impl SortCfg {
                 return o;
             }
         } else if self.extnorder && !pb.is_dir_or_dirlnk() {
-            let ext = |n: &[u8]| n.iter().rposition(|&c| c == b'.').map(|i| n[i..].to_vec());
+            fn ext(n: &[u8]) -> Option<&[u8]> {
+                n.iter().rposition(|&c| c == b'.').map(|i| &n[i..])
+            }
             match (ext(&pa.name), ext(&pb.name)) {
                 (None, None) => {}
                 (None, Some(_)) => return Ordering::Less,
                 (Some(_), None) => return Ordering::Greater,
                 (Some(a), Some(b)) => {
-                    let r = locale::strcasecmp(&a, &b);
+                    let r = locale::strcasecmp(a, b);
                     if r != 0 {
                         return sign(r);
                     }
@@ -275,6 +277,41 @@ impl SortCfg {
         }
         let o = self.namecmp(&pa.name, &pb.name);
         if self.reverse { o.reverse() } else { o }
+    }
+
+    /// Sort `entries` by `fuzzyentrycmp`, computing each entry's fuzzy score once in O(N).
+    pub fn sort_fuzzy(&self, entries: &mut [Entry], filter: &[u8], ic: bool) {
+        let mut order: Vec<(usize, i32)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, fuzzy_match_score(filter, &e.name, ic)))
+            .collect();
+        order.sort_by(|&(ia, sa), &(ib, sb)| {
+            let (pa, pb) = (&entries[ia], &entries[ib]);
+            if pb.is_dir_or_dirlnk() != pa.is_dir_or_dirlnk() {
+                return if pb.is_dir_or_dirlnk() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            if sa != sb {
+                let o = sa.cmp(&sb);
+                return if self.reverse { o.reverse() } else { o };
+            }
+            let o = self.namecmp(&pa.name, &pb.name);
+            if self.reverse { o.reverse() } else { o }
+        });
+        for i in 0..order.len() {
+            let mut cur = i;
+            while order[cur].0 != i {
+                let next = order[cur].0;
+                entries.swap(cur, next);
+                order[cur].0 = cur;
+                cur = next;
+            }
+            order[cur].0 = cur;
+        }
     }
 
     fn reset_sort_flags(&mut self) {
@@ -589,5 +626,53 @@ mod tests {
         assert_eq!(c.set_sort_flags(b'S'), (b's', false));
         assert_eq!(c.getorderstr(), "SR ");
         assert_eq!(c.set_sort_flags(b'x'), (0, false));
+    }
+
+    #[test]
+    fn sort_fuzzy_matches_fuzzyentrycmp_order() {
+        let names: &[(&[u8], bool)] = &[
+            (b"alpha", true),
+            (b"Beta", true),
+            (b"foo_bar", true),
+            (b"f_b", true),
+            (b"zzz", true),
+            (b"fb", false),
+            (b"f-b", false),
+            (b"foo_bar.rs", false),
+            (b"FooBar.txt", false),
+            (b"a_foo_b", false),
+            (b"bar_foo", false),
+            (b"f123b", false),
+            (b"FB", false),
+            (b"f_b_c", false),
+            (b"x_f_b", false),
+            (b"foo_baz", false),
+            (b"file_b", false),
+            (b"f.b", false),
+            (b"other", false),
+            (b"my_fb_file", false),
+        ];
+        let base: Vec<Entry> = names
+            .iter()
+            .map(|&(name, is_dir)| Entry {
+                name: name.to_vec(),
+                flags: if is_dir { DIR_OR_DIRLNK } else { 0 },
+                ..Default::default()
+            })
+            .collect();
+        for reverse in [false, true] {
+            for ic in [false, true] {
+                let sort = SortCfg {
+                    reverse,
+                    rev_fn: reverse,
+                    ..Default::default()
+                };
+                let mut expected = base.clone();
+                expected.sort_by(|a, b| sort.fuzzyentrycmp(b"fb", ic, a, b));
+                let mut actual = base.clone();
+                sort.sort_fuzzy(&mut actual, b"fb", ic);
+                assert_eq!(actual, expected, "reverse={reverse} ic={ic}");
+            }
+        }
     }
 }

@@ -6,6 +6,7 @@ use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat};
 use rustix::termios::{OptionalActions, Termios};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::{OsStr, c_char};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -13,8 +14,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const NULL_DEVICE: &[u8] = b"/dev/null";
 pub const TTY_DEVICE: &[u8] = b"/dev/tty";
@@ -161,30 +162,54 @@ fn name_from(p: *const c_char) -> Option<Vec<u8>> {
 
 /// `getpwuid(uid)->pw_name`
 pub fn user_name(uid: u32) -> Option<Vec<u8>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<Vec<u8>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock()
+        && let Some(cached) = map.get(&uid)
+    {
+        return cached.clone();
+    }
     let mut buf = vec![0 as c_char; 16384];
     // SAFETY: passwd is plain data; getpwuid_r fills it and points its strings into buf.
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut res: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: all pointers are valid for the call and buf.len() is its size.
     let rc = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut res) };
-    if rc != 0 || res.is_null() {
-        return None;
+    let name = if rc != 0 || res.is_null() {
+        None
+    } else {
+        name_from(pw.pw_name)
+    };
+    if let Ok(mut map) = cache.lock() {
+        map.insert(uid, name.clone());
     }
-    name_from(pw.pw_name)
+    name
 }
 
 /// `getgrgid(gid)->gr_name`
 pub fn group_name(gid: u32) -> Option<Vec<u8>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<Vec<u8>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock()
+        && let Some(cached) = map.get(&gid)
+    {
+        return cached.clone();
+    }
     let mut buf = vec![0 as c_char; 16384];
     // SAFETY: group is plain data; getgrgid_r fills it and points its strings into buf.
     let mut gr: libc::group = unsafe { std::mem::zeroed() };
     let mut res: *mut libc::group = std::ptr::null_mut();
     // SAFETY: all pointers are valid for the call and buf.len() is its size.
     let rc = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut res) };
-    if rc != 0 || res.is_null() {
-        return None;
+    let name = if rc != 0 || res.is_null() {
+        None
+    } else {
+        name_from(gr.gr_name)
+    };
+    if let Ok(mut map) = cache.lock() {
+        map.insert(gid, name.clone());
     }
-    name_from(gr.gr_name)
+    name
 }
 
 pub fn private_mode(o: &mut OpenOptions) -> &mut OpenOptions {
@@ -639,10 +664,19 @@ pub mod glibc {
         fn c_mblen(s: *const c_char, n: libc::size_t) -> c_int;
     }
 
-    fn cstr(s: &[u8]) -> CString {
-        // INFALLIBLE: names and filters come from C strings and hold no NUL; cut at one if they do.
+    fn with_cstr<R>(s: &[u8], f: impl FnOnce(*const c_char) -> R) -> R {
+        // Names and filters come from C strings and hold no NUL; cut at one if they do.
         let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
-        CString::new(&s[..end]).unwrap_or_default()
+        let bytes = &s[..end];
+        if bytes.len() < 256 {
+            let mut buf = [0u8; 256];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            f(buf.as_ptr().cast::<c_char>())
+        } else {
+            // INFALLIBLE: `bytes` has no interior NUL.
+            let cs = CString::new(bytes).unwrap_or_default();
+            f(cs.as_ptr())
+        }
     }
 
     /// `setlocale(LC_COLLATE, ""); setlocale(LC_CTYPE, "")`, as `main()` does.
@@ -656,15 +690,21 @@ pub mod glibc {
     }
 
     pub fn strcoll(a: &[u8], b: &[u8]) -> i32 {
-        let (a, b) = (cstr(a), cstr(b));
-        // SAFETY: both pointers are valid NUL-terminated strings for the call.
-        unsafe { libc::strcoll(a.as_ptr(), b.as_ptr()) }
+        with_cstr(a, |a| {
+            with_cstr(b, |b| {
+                // SAFETY: both pointers are valid NUL-terminated strings for the call.
+                unsafe { libc::strcoll(a, b) }
+            })
+        })
     }
 
     pub fn strcasecmp(a: &[u8], b: &[u8]) -> i32 {
-        let (a, b) = (cstr(a), cstr(b));
-        // SAFETY: both pointers are valid NUL-terminated strings for the call.
-        unsafe { libc::strcasecmp(a.as_ptr(), b.as_ptr()) }
+        with_cstr(a, |a| {
+            with_cstr(b, |b| {
+                // SAFETY: both pointers are valid NUL-terminated strings for the call.
+                unsafe { libc::strcasecmp(a, b) }
+            })
+        })
     }
 
     /// `tolower()` on one byte, as glibc's `strcasestr` folds.
@@ -675,11 +715,10 @@ pub mod glibc {
 
     /// `mbstowcs(dst, s, max)`: at most `max` wide characters, `None` for `(size_t)-1`.
     pub fn mbstowcs(s: &[u8], max: usize) -> Option<Wide> {
-        let src = cstr(s);
         let mut buf: Vec<libc::wchar_t> = vec![0; max + 1];
         // SAFETY: buf holds max + 1 wide chars and mbstowcs writes at most max of them;
-        // src is NUL-terminated.
-        let n = unsafe { c_mbstowcs(buf.as_mut_ptr(), src.as_ptr(), max) };
+        // src is NUL-terminated for the call.
+        let n = with_cstr(s, |src| unsafe { c_mbstowcs(buf.as_mut_ptr(), src, max) });
         if n == usize::MAX {
             return None;
         }
@@ -689,9 +728,8 @@ pub mod glibc {
 
     /// `mblen(s, MB_LEN_MAX)` at the start of `s`.
     pub fn mblen_at(s: &[u8]) -> i32 {
-        let src = cstr(s);
         // SAFETY: src is NUL-terminated, so mblen never reads past it.
-        unsafe { c_mblen(src.as_ptr(), 16) }
+        with_cstr(s, |src| unsafe { c_mblen(src, 16) })
     }
 
     pub fn to_lower_wide(c: i32) -> i32 {
@@ -742,20 +780,20 @@ pub mod glibc {
 
     impl Regex {
         pub fn new(pattern: &[u8], icase: bool) -> Option<Regex> {
-            let p = cstr(pattern);
             // SAFETY: regex_t is plain data that regcomp initialises.
             let mut re: Box<libc::regex_t> = Box::new(unsafe { std::mem::zeroed() });
             let flags =
                 libc::REG_NOSUB | libc::REG_EXTENDED | if icase { libc::REG_ICASE } else { 0 };
             // SAFETY: re points to writable storage for a regex_t, p is NUL-terminated.
-            let rc = unsafe { libc::regcomp(&mut *re, p.as_ptr(), flags) };
+            let rc = with_cstr(pattern, |p| unsafe { libc::regcomp(&mut *re, p, flags) });
             (rc == 0).then_some(Regex(re))
         }
 
         pub fn is_match(&self, s: &[u8]) -> bool {
-            let s = cstr(s);
             // SAFETY: self.0 was compiled by regcomp; REG_NOSUB needs no match array.
-            unsafe { libc::regexec(&*self.0, s.as_ptr(), 0, std::ptr::null_mut(), 0) == 0 }
+            with_cstr(s, |s| unsafe {
+                libc::regexec(&*self.0, s, 0, std::ptr::null_mut(), 0) == 0
+            })
         }
     }
 
@@ -811,5 +849,36 @@ mod tests {
 
         w.unwatch();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(feature = "portable"))]
+    #[test]
+    fn strcoll_handles_short_and_long_names() {
+        assert_eq!(glibc::strcoll(b"abc", b"abc"), 0);
+        assert!(glibc::strcoll(b"abc", b"abd") < 0);
+        assert_eq!(glibc::strcasecmp(b"AbC", b"aBc"), 0);
+        assert!(glibc::strcasecmp(b"abc", b"abd") < 0);
+
+        // Long (> 255 byte) names exercise the CString heap fallback.
+        let long_a = vec![b'a'; 300];
+        let mut long_b = vec![b'a'; 300];
+        long_b[299] = b'b';
+        assert_eq!(glibc::strcoll(&long_a, &long_a), 0);
+        assert!(glibc::strcoll(&long_a, &long_b) < 0);
+        let long_upper = vec![b'A'; 300];
+        assert_eq!(glibc::strcasecmp(&long_a, &long_upper), 0);
+        assert!(glibc::strcasecmp(&long_a, &long_b) < 0);
+
+        // Embedded NUL terminates the C string at the first NUL byte.
+        assert_eq!(glibc::strcoll(b"abc\0zzz", b"abc\0aaa"), 0);
+        assert_eq!(glibc::strcasecmp(b"AbC\0zzz", b"aBc\0aaa"), 0);
+        let mut long_nul_a = vec![b'a'; 300];
+        let mut long_nul_b = vec![b'a'; 300];
+        long_nul_a[270] = 0;
+        long_nul_b[270] = 0;
+        long_nul_a[280] = b'x';
+        long_nul_b[280] = b'y';
+        assert_eq!(glibc::strcoll(&long_nul_a, &long_nul_b), 0);
+        assert_eq!(glibc::strcasecmp(&long_nul_a, &long_nul_b), 0);
     }
 }
