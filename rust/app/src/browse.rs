@@ -624,11 +624,11 @@ impl Nnn {
                 self.popup.curssn.clear();
             } else if args.operands.is_empty() {
                 // Start in the current directory.
-                initpath = match getenv("PWD") {
-                    Some(p) if !p.is_empty() => Some(p),
+                initpath = match std::env::var_os("PWD") {
+                    Some(p) if !p.is_empty() => Some(crate::platform::into_bytes(p)),
                     _ => std::env::current_dir()
                         .ok()
-                        .map(|p| p.into_os_string().into_encoded_bytes()),
+                        .map(|p| crate::platform::into_bytes(p.into_os_string())),
                 };
                 if initpath.is_none() {
                     initpath = Some(b"/".to_vec());
@@ -1222,7 +1222,7 @@ impl Nnn {
         // A symlink: its target, then the file it resolves to.
         if sb.file_type().is_symlink() {
             if let Ok(t) = std::fs::read_link(os(&fpath)) {
-                let t = t.into_os_string().into_encoded_bytes();
+                let t = crate::platform::into_bytes(t.into_os_string());
                 let t = &t[..t.len().min(PATH_MAX - 1)];
                 if !t.is_empty() {
                     let mut line = b"-> ".to_vec();
@@ -1340,7 +1340,7 @@ impl Nnn {
         if self.g_state.initfile {
             match std::env::current_dir() {
                 Ok(d) => {
-                    *ipath = d.into_os_string().into_encoded_bytes();
+                    *ipath = crate::platform::into_bytes(d.into_os_string());
                     self.initpath.clone_from(ipath);
                 }
                 Err(_) => return false,
@@ -2026,7 +2026,7 @@ impl Nnn {
                 let Ok(rp) = std::fs::canonicalize(os(&pent.name)) else {
                     return Flow::WarnNochange;
                 };
-                b.newpath = xdirname(&rp.into_os_string().into_encoded_bytes());
+                b.newpath = xdirname(&crate::platform::into_bytes(rp.into_os_string()));
                 if !chdir(&b.newpath) {
                     return Flow::WarnNochange;
                 }

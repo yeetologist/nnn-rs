@@ -268,6 +268,8 @@ def main():
     for case in cases:
         if only and case["name"] not in only:
             continue
+        if "unix" not in case.get("platforms", ["unix"]):
+            continue
         total += 1
         got = run_case(build, case)
         path = os.path.join(exp_dir, case["name"] + ".json")

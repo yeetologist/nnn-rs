@@ -146,6 +146,45 @@ pub fn remove_all(p: &[u8]) -> io::Result<()> {
     }
 }
 
+/// What `rm -r p` would remove, children before their directory, each with whether it is a
+/// directory; a link is listed, never followed.
+pub fn rm_entries(p: &[u8]) -> Vec<(Vec<u8>, bool)> {
+    let mut out = Vec::new();
+    let Ok(meta) = fs::symlink_metadata(path(p)) else {
+        return out;
+    };
+    if meta.is_dir()
+        && let Ok(rd) = fs::read_dir(path(p))
+    {
+        for e in rd.flatten() {
+            out.extend(rm_entries(&join(p, &platform::into_bytes(e.file_name()))));
+        }
+    }
+    out.push((p.to_vec(), meta.is_dir()));
+    out
+}
+
+/// What `rm -v` prints for the `entries` (from `rm_entries`) that are gone now: GNU's
+/// "removed 'x'" and "removed directory 'x'", a name holding `'` in double quotes.
+pub fn rm_verbose(entries: &[(Vec<u8>, bool)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (p, is_dir) in entries {
+        if fs::symlink_metadata(path(p)).is_ok() {
+            continue;
+        }
+        out.extend_from_slice(if *is_dir {
+            b"removed directory "
+        } else {
+            b"removed "
+        });
+        let q = if p.contains(&b'\'') { b'"' } else { b'\'' };
+        out.push(q);
+        out.extend_from_slice(p);
+        out.extend_from_slice(&[q, b'\n']);
+    }
+    out
+}
+
 /// `rm -ri`'s answer for one entry: unless `force`, `confirm(path)` decides first. True
 /// when `path` was removed, false when declined.
 pub fn remove_confirmed(
@@ -389,6 +428,30 @@ mod tests {
         assert!(!dir.join("t").exists());
         assert!(!dir.join("g").exists());
         assert!(remove_all(&b(&dir.join("g"))).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_v_reports_what_was_removed() {
+        let dir = scratch("rmv");
+        std::fs::create_dir_all(dir.join("t").join("u")).unwrap();
+        std::fs::write(dir.join("t").join("u").join("f"), b"x").unwrap();
+        std::fs::write(dir.join("it's"), b"x").unwrap();
+        let t = b(&dir.join("t"));
+        let q = b(&dir.join("it's"));
+        let entries = [rm_entries(&t), rm_entries(&q)].concat();
+        assert_eq!(rm_verbose(&entries), b"");
+        remove_all(&t).unwrap();
+        remove_all(&q).unwrap();
+        let s = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+        let want = format!(
+            "removed '{}/u/f'\nremoved directory '{}/u'\nremoved directory '{}'\nremoved \"{}\"\n",
+            s(&t),
+            s(&t),
+            s(&t),
+            s(&q)
+        );
+        assert_eq!(s(&rm_verbose(&entries)), want);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

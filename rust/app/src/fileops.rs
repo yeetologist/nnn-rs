@@ -545,12 +545,26 @@ impl Nnn {
         true
     }
 
-    /// `rm -rf` (`force`) or `rm -ri` of one path on Windows: unless forced,
-    /// `rm -rf '<name>'?` is asked first. True when it was removed.
+    /// `rm -vrf` (`force`) or `rm -vri` of one path on Windows: unless forced,
+    /// `rm -rf '<name>'?` is asked first. What `-v` reports is printed outside curses, as
+    /// the original's rm prints it. True when it was removed.
     #[cfg(windows)]
     pub(crate) fn remove_native(&mut self, p: &[u8], force: bool) -> std::io::Result<bool> {
+        let entries = crate::winops::rm_entries(p);
         let mut confirm = |p: &[u8]| crate::prompt::xconfirm(self.get_input(Some(&rm_prompt(p))));
-        crate::winops::remove_confirmed(p, force, &mut confirm)
+        let done = crate::winops::remove_confirmed(p, force, &mut confirm);
+        let report = crate::winops::rm_verbose(&entries);
+        if !report.is_empty() {
+            self.exitcurses();
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&report);
+            let _ = out.flush();
+            if let Some(cs) = self.curses.as_mut() {
+                cs.resume();
+                cs.refresh();
+            }
+        }
+        done
     }
 
     /// `batch_rename`: rename the current dir's entries or the selection in the editor.

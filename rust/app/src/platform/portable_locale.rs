@@ -7,7 +7,7 @@
 //! rust/oracle/portable-known-diffs.md.
 
 use crate::locale::{LocalTime, Wide};
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, FixedOffset, Local, Timelike};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use unicode_width::UnicodeWidthChar;
@@ -134,10 +134,54 @@ pub fn wcstombs(s: &[i32]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The fixed zone a POSIX `TZ` without daylight-saving rules names (`UTC`, `UTC0`, `EST5`,
+/// `<+0530>-5:30`), as seconds east of UTC; glibc reads a name without an offset as UTC.
+/// None for anything else (unset, zoneinfo names, DST rules): the system's zone applies.
+fn tz_fixed_offset(tz: &str) -> Option<i32> {
+    let rest = match tz.strip_prefix('<') {
+        Some(quoted) => &quoted[quoted.find('>')? + 1..],
+        None => {
+            let name = tz.bytes().take_while(u8::is_ascii_alphabetic).count();
+            if name < 3 {
+                return None;
+            }
+            &tz[name..]
+        }
+    };
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let (west, hms) = match rest.as_bytes()[0] {
+        b'-' => (false, &rest[1..]),
+        b'+' => (true, &rest[1..]),
+        _ => (true, rest),
+    };
+    let mut secs = 0;
+    let mut parts = 0;
+    for (part, unit) in hms.split(':').zip([3600, 60, 1]) {
+        if part.is_empty() || part.len() > 2 || !part.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        secs += part.parse::<i32>().ok()? * unit;
+        parts += 1;
+    }
+    if parts != hms.split(':').count() || secs > 24 * 3600 {
+        return None;
+    }
+    Some(if west { -secs } else { secs })
+}
+
 pub fn localtime(secs: i64) -> LocalTime {
-    let t = DateTime::from_timestamp(secs, 0)
-        .unwrap_or_default()
-        .with_timezone(&Local);
+    static ZONE: OnceLock<Option<FixedOffset>> = OnceLock::new();
+    let zone = ZONE.get_or_init(|| {
+        let tz = std::env::var("TZ").ok()?;
+        FixedOffset::east_opt(tz_fixed_offset(&tz)?)
+    });
+    let utc = DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    let t = match zone {
+        Some(z) => utc.with_timezone(z).naive_local(),
+        None => utc.with_timezone(&Local).naive_local(),
+    };
     LocalTime {
         year: t.year(),
         mon: t.month() as i32,
@@ -577,5 +621,18 @@ mod tests {
                 "{bad} should not compile"
             );
         }
+    }
+
+    #[test]
+    fn tz_names_a_fixed_zone_as_glibc_reads_it() {
+        assert_eq!(tz_fixed_offset("UTC"), Some(0));
+        assert_eq!(tz_fixed_offset("UTC0"), Some(0));
+        assert_eq!(tz_fixed_offset("GMT"), Some(0));
+        assert_eq!(tz_fixed_offset("EST5"), Some(-5 * 3600));
+        assert_eq!(tz_fixed_offset("JST-9"), Some(9 * 3600));
+        assert_eq!(tz_fixed_offset("<+0530>-5:30"), Some(5 * 3600 + 30 * 60));
+        assert_eq!(tz_fixed_offset("Europe/Paris"), None);
+        assert_eq!(tz_fixed_offset("CET-1CEST,M3.5.0,M10.5.0/3"), None);
+        assert_eq!(tz_fixed_offset(""), None);
     }
 }

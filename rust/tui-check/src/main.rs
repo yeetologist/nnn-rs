@@ -5,6 +5,9 @@
 //! compared with the same expected/*.json.
 //!
 //!   tui-check check <build...> [--case NAME]... [--verbose]
+//!   tui-check record <build...> [--case NAME]...   write expected/<case>.json from the build
+//!
+//! A key token "<Resize COLSxROWS>" resizes the pty instead of typing.
 
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use regex::{Captures, Regex};
@@ -68,6 +71,13 @@ fn key_bytes(tok: &str, app_cursor: bool) -> Vec<u8> {
         }
     };
     named.into_bytes()
+}
+
+/// The size a "<Resize COLSxROWS>" key token asks the pty to take.
+fn resize_token(tok: &str) -> Option<(u16, u16)> {
+    let size = tok.strip_prefix("<Resize ")?.strip_suffix('>')?;
+    let (cols, rows) = size.split_once('x')?;
+    Some((cols.parse().ok()?, rows.parse().ok()?))
 }
 
 /// GLOBAL_NORMALIZE: every time but the fixture's becomes "<NOW>", scanning as Python's
@@ -136,12 +146,13 @@ fn windows_normalize(line: &str) -> String {
         Regex::new(r"^(.(?:\d{4}-\d\d-\d\d \d\d:\d\d|<NOW>))  [0-7]{3} +(\S+) ([ +].*)$")
             .expect("regex")
     });
-    static DIR_SIZE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"d[-rwxsStTl]{9} \S+").expect("regex"));
-    static PERM: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"[-dlcbsp?][-rwxsStTl]{9}").expect("regex"));
-    static HARD_LINK: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(<PERM> .*) \d+-\d+$").expect("regex"));
+    // The status bar: "N/M <flags> <time> <perm> <size>[ <type>][ <links>-<inode>]".
+    static STATUS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"^(\d+/\d+ .*?(?:\d{4}-\d\d-\d\d \d\d:\d\d|<NOW>) )([-dlcbsp?])[-rwxsStTl]{9} (\S+)(.*?)(?: \d+-\d+)?$",
+        )
+        .expect("regex")
+    });
     let line = DETAIL.replace(line, |c: &Captures<'_>| {
         let size = if c[3].ends_with('/') {
             "<DSIZE>"
@@ -150,9 +161,12 @@ fn windows_normalize(line: &str) -> String {
         };
         format!("{}  <OCT> {size} {}", &c[1], &c[3])
     });
-    let line = DIR_SIZE.replace_all(&line, "<PERM> <DSIZE>");
-    let line = PERM.replace_all(&line, "<PERM>");
-    HARD_LINK.replace(&line, "$1").into_owned()
+    STATUS
+        .replace(&line, |c: &Captures<'_>| {
+            let size = if &c[2] == "d" { "<DSIZE>" } else { &c[3] };
+            format!("{}<PERM> {size}{}", &c[1], &c[4])
+        })
+        .into_owned()
 }
 
 /// How a case's screen is turned into the text that is compared.
@@ -348,7 +362,7 @@ struct Session {
     status: Option<ExitStatus>,
     /// The end of the output so far, to spot a cursor-position request split across reads.
     tail: Vec<u8>,
-    _master: Box<dyn MasterPty + Send>,
+    master: Box<dyn MasterPty + Send>,
 }
 
 impl Session {
@@ -385,7 +399,7 @@ impl Session {
             child,
             status: None,
             tail: Vec::new(),
-            _master: pair.master,
+            master: pair.master,
         })
     }
 
@@ -395,15 +409,22 @@ impl Session {
         while let Ok(chunk) = self.output.try_recv() {
             self.parser.process(&chunk);
             self.tail.extend_from_slice(&chunk);
-            let asks = self.tail.windows(4).filter(|w| w == b"\x1b[6n").count();
-            for _ in 0..asks {
+            let asks: Vec<usize> = self
+                .tail
+                .windows(4)
+                .enumerate()
+                .filter(|(_, w)| w == b"\x1b[6n")
+                .map(|(at, _)| at + 4)
+                .collect();
+            for _ in &asks {
                 let (row, col) = self.parser.screen().cursor_position();
                 let answer = format!("\x1b[{};{}R", row + 1, col + 1);
                 self.writer.write_all(answer.as_bytes())?;
                 self.writer.flush()?;
             }
-            let keep = if asks > 0 { 0 } else { 3 };
-            let cut = self.tail.len().saturating_sub(keep);
+            // Keep what may start a request split across reads, never one already answered.
+            let answered = asks.last().copied().unwrap_or(0);
+            let cut = self.tail.len().saturating_sub(3).max(answered);
             self.tail.drain(..cut);
         }
         Ok(())
@@ -412,10 +433,11 @@ impl Session {
     fn screen(&mut self, norm: &Normalizer) -> Res<Vec<String>> {
         self.pump()?;
         let screen = self.parser.screen();
-        Ok((0..ROWS)
+        let (rows, cols) = screen.size();
+        Ok((0..rows)
             .map(|row| {
                 let mut line = String::new();
-                for col in 0..COLS {
+                for col in 0..cols {
                     match screen.cell(row, col) {
                         Some(c) if c.is_wide_continuation() => {}
                         Some(c) if c.has_contents() => line.push_str(c.contents()),
@@ -455,7 +477,23 @@ impl Session {
         }))
     }
 
+    /// Resizes the pty (the build sees a window change) and the emulator with it.
+    fn resize(&mut self, cols: u16, rows: u16) -> Res<()> {
+        self.pump()?;
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.parser.screen_mut().set_size(rows, cols);
+        Ok(())
+    }
+
     fn send(&mut self, tok: &str) -> Res<()> {
+        if let Some((cols, rows)) = resize_token(tok) {
+            return self.resize(cols, rows);
+        }
         self.pump()?;
         let bytes = key_bytes(tok, self.parser.screen().application_cursor());
         self.writer.write_all(&bytes)?;
@@ -513,12 +551,23 @@ fn case_env(home: &Path, work: &Path, case: &Value) -> Vec<(String, String)> {
     env
 }
 
+/// The case's temp dir, as long as harness.py's `/tmp/nnnh-XXXXXXXX` (18 bytes): screens wrap
+/// and session files record lengths by it. On Windows it is `C:\nnnh-XXXXXXXXXX` on the
+/// temp dir's drive, `%TEMP%` being far longer than `/tmp`.
+fn case_tempdir() -> Res<tempfile::TempDir> {
+    let mut b = tempfile::Builder::new();
+    b.prefix("nnnh-");
+    if cfg!(windows) {
+        let temp = std::env::temp_dir();
+        let root = temp.ancestors().last().unwrap_or(&temp).to_path_buf();
+        return Ok(b.rand_bytes(10).tempdir_in(root)?);
+    }
+    Ok(b.rand_bytes(8).tempdir()?)
+}
+
 /// One run of a case: {exit, snaps, work, files}.
 fn run_case(build: &[String], case: &Value) -> Res<Value> {
-    let tmp = tempfile::Builder::new()
-        .prefix("nnnh-")
-        .rand_bytes(8)
-        .tempdir()?;
+    let tmp = case_tempdir()?;
     let (home, work) = (tmp.path().join("home"), tmp.path().join("work"));
     fs::create_dir_all(&home)?;
     let empty = Map::new();
@@ -668,7 +717,7 @@ struct Options {
     build: Vec<String>,
 }
 
-const USAGE: &str = "usage: tui-check check <build...> [--case NAME]... [--verbose]";
+const USAGE: &str = "usage: tui-check (check|record) <build...> [--case NAME]... [--verbose]";
 
 fn parse(args: &[String]) -> Res<(String, Options)> {
     let (mode, rest) = args.split_first().ok_or(USAGE)?;
@@ -692,14 +741,52 @@ fn parse(args: &[String]) -> Res<(String, Options)> {
     Ok((mode.clone(), o))
 }
 
+fn load_cases() -> Res<Vec<Value>> {
+    Ok(serde_json::from_str(&fs::read_to_string(
+        cases_dir().join("cases.json"),
+    )?)?)
+}
+
+fn case_name(case: &Value) -> Res<&str> {
+    Ok(case["name"].as_str().ok_or("case without a name")?)
+}
+
+fn named(o: &Options, name: &str) -> bool {
+    o.only.iter().any(|n| n == name)
+}
+
+/// Writes expected/<case>.json from the build, as harness.py record does: two runs must agree.
+/// The cases that run here, or the ones named with --case whatever their platforms (an
+/// OS-independent case for another OS is recorded from this OS's build).
+fn record(o: &Options) -> Res<bool> {
+    let dir = cases_dir().join("expected");
+    fs::create_dir_all(&dir)?;
+    let (mut passed, mut total) = (0, 0);
+    for case in &load_cases()? {
+        let name = case_name(case)?;
+        if !(named(o, name) || (o.only.is_empty() && runs_here(case))) {
+            continue;
+        }
+        total += 1;
+        let got = run_case(&o.build, case)?;
+        if run_case(&o.build, case)? != got {
+            println!("NOISE {name}: two runs of the build differ");
+            continue;
+        }
+        fs::write(dir.join(format!("{name}.json")), dumps(&got)?.join("\n"))?;
+        passed += 1;
+    }
+    println!("{passed}/{total} tui cases recorded");
+    Ok(passed == total)
+}
+
 /// Compares the build against expected/: true when every case that runs here passes.
 fn check(o: &Options) -> Res<bool> {
     let dir = cases_dir();
-    let cases: Vec<Value> = serde_json::from_str(&fs::read_to_string(dir.join("cases.json"))?)?;
     let (mut passed, mut total) = (0, 0);
-    for case in &cases {
-        let name = case["name"].as_str().ok_or("case without a name")?;
-        if (!o.only.is_empty() && !o.only.iter().any(|n| n == name)) || !runs_here(case) {
+    for case in &load_cases()? {
+        let name = case_name(case)?;
+        if (!o.only.is_empty() && !named(o, name)) || !runs_here(case) {
             continue;
         }
         total += 1;
@@ -734,6 +821,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let run = parse(&args).and_then(|(mode, o)| match mode.as_str() {
         "check" => check(&o),
+        "record" => record(&o),
         _ => Err(USAGE.into()),
     });
     match run {
@@ -758,6 +846,9 @@ mod tests {
         assert_eq!(key_bytes("<C-R>", false), [0x12]);
         assert_eq!(key_bytes("<Enter>", false), b"\r");
         assert_eq!(key_bytes("touch x", false), b"touch x");
+        assert_eq!(resize_token("<Resize 100x30>"), Some((100, 30)));
+        assert_eq!(resize_token("<Resize 100>"), None);
+        assert_eq!(resize_token("<Esc>"), None);
     }
 
     #[test]
@@ -793,6 +884,11 @@ mod tests {
         assert_eq!(
             windows_normalize("2/11  2023-11-14 22:13 -rw-r--r-- 6B txt 2-1234"),
             "2/11  2023-11-14 22:13 <PERM> 6B txt"
+        );
+        assert_eq!(windows_normalize(" drwxr-xr-x 80B"), " drwxr-xr-x 80B");
+        assert_eq!(
+            windows_normalize("1/11  +1   <NOW> -rw-r--r-- 0B"),
+            "1/11  +1   <NOW> <PERM> 0B"
         );
     }
 
