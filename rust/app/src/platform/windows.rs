@@ -291,6 +291,20 @@ pub fn private_mode(o: &mut OpenOptions) -> &mut OpenOptions {
 
 pub fn raise_open_files_limit() {}
 
+/// `setenv(name, value, 1)`: variables nnn exports to the programs it starts.
+pub fn setenv(name: &str, value: &[u8]) {
+    let v = &*os(value);
+    // SAFETY: nnn sets these from its main thread at points where no other thread reads or
+    // writes the environment (the du workers never touch it).
+    unsafe { std::env::set_var(name, v) };
+}
+
+/// `unsetenv(name)`
+pub fn unsetenv(name: &str) {
+    // SAFETY: as for setenv.
+    unsafe { std::env::remove_var(name) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,18 +395,4 @@ mod tests {
     fn backslashes_become_slashes() {
         assert_eq!(&*bytes(OsStr::new("C:\\a\\b")), b"C:/a/b");
     }
-}
-
-/// `setenv(name, value, 1)`: variables nnn exports to the programs it starts.
-pub fn setenv(name: &str, value: &[u8]) {
-    let v = &*os(value);
-    // SAFETY: nnn sets these from its main thread at points where no other thread reads or
-    // writes the environment (the du workers never touch it).
-    unsafe { std::env::set_var(name, v) };
-}
-
-/// `unsetenv(name)`
-pub fn unsetenv(name: &str) {
-    // SAFETY: as for setenv.
-    unsafe { std::env::remove_var(name) };
 }
