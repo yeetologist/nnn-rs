@@ -1713,5 +1713,39 @@
   "fixture": {
    "Gamma": "x\n"
   }
+ },
+ {
+  "name": "win-archive-sel",
+  "platforms": [
+   "windows"
+  ],
+  "env": {
+   "PATH": "C:\\Windows\\System32"
+  },
+  "note": "Recorded on Windows without Git or Coreutils on PATH (hand-verified first run): z, s, relative: tar.exe -acvf g.tar --null -T <list> prints 'a beta.md' and 'a Gamma'; g.tar is created and the selection cleared.",
+  "args": [],
+  "keys": [
+   "j",
+   "j",
+   " ",
+   "j",
+   " ",
+   "z",
+   "s",
+   "g.tar",
+   "<Enter>",
+   "y",
+   "<Enter>",
+   "q"
+  ],
+  "fixture": {
+   "alpha.txt": "hello\n",
+   "beta.md": "# b\n",
+   "Gamma": "x\n"
+  },
+  "nohash": [
+   "g\\.tar"
+  ],
+  "quiet": 1.5
  }
 ]

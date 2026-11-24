@@ -109,6 +109,53 @@ fn windows_tar_cmd(system_root: Option<&std::ffi::OsStr>) -> Vec<u8> {
     }
 }
 
+/// If `cmd` invokes `tar` or `bsdtar`, builds `<cmd...> <archive> --null -T <list>` so tar
+/// reads the NUL-separated selection list directly without `xargs` or a shell.
+pub(crate) fn tar_list_argv(cmd: &[u8], archive: &[u8], list: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut argv = tar_cmd_prefix(cmd)?;
+    argv.push(cstr(archive).to_vec());
+    argv.push(b"--null".to_vec());
+    argv.push(b"-T".to_vec());
+    argv.push(cstr(list).to_vec());
+    Some(argv)
+}
+
+fn tar_cmd_prefix(cmd: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let argv = crate::popup::parseargs(cstr(cmd))?;
+    let first = argv.first()?;
+    let base = first
+        .rsplit(|&c| c == b'/' || c == b'\\')
+        .next()
+        .unwrap_or(first);
+    let lower: Vec<u8> = base.iter().map(u8::to_ascii_lowercase).collect();
+    let stem = lower.strip_suffix(b".exe").unwrap_or(&lower);
+    if stem != b"tar" && stem != b"bsdtar" {
+        return None;
+    }
+    Some(argv)
+}
+
+/// Windows tar-family argv for a selection: passes entries directly as UTF-16 argv when they
+/// fit under `CreateProcessW`'s limit (so bsdtar receives Unicode names without `-T`'s
+/// ANSI codepage decoding), and falls back to `--null -T <list>` for oversized selections.
+fn tar_selection_argv(
+    cmd: &[u8],
+    archive: &[u8],
+    entries: &[&[u8]],
+    list: &[u8],
+) -> Option<Vec<Vec<u8>>> {
+    let mut argv = tar_cmd_prefix(cmd)?;
+    let approx_len: usize =
+        cmd.len() + archive.len() + 8 + entries.iter().map(|e| e.len() + 3).sum::<usize>();
+    if !entries.is_empty() && approx_len <= 28_000 {
+        argv.push(cstr(archive).to_vec());
+        argv.push(b"--".to_vec());
+        argv.extend(entries.iter().map(|e| e.to_vec()));
+        return Some(argv);
+    }
+    tar_list_argv(cmd, archive, list)
+}
+
 impl Nnn {
     /// `printwarn(presel)` for an error Rust reports instead of leaving it in errno.
     fn printwarn_err(&mut self, e: &io::Error, presel: Option<&mut i32>) {
@@ -185,7 +232,30 @@ impl Nnn {
             None => self.selpath.clone().unwrap_or_default(),
         };
 
-        if cfg!(windows) && crate::platform::has_coreutil(b"xargs") {
+        let win_tar_argv = if cfg!(windows) {
+            let path_bytes = cstr(path);
+            let dirlen = path_bytes.len() + usize::from(path_bytes != b"/");
+            let entries: Vec<&[u8]> = self
+                .pselbuf
+                .split(|&c| c == 0)
+                .filter(|e| !e.is_empty())
+                .map(|e| {
+                    if relative {
+                        e.get(dirlen..).unwrap_or_default()
+                    } else {
+                        e
+                    }
+                })
+                .collect();
+            tar_selection_argv(cmd, archive, &entries, &selpath)
+        } else {
+            None
+        };
+
+        if let Some(argv) = win_tar_argv {
+            let cwd = relative.then(|| cstr(path));
+            self.spawn_argv(&argv, 1, cwd, F_CLI | F_CONFIRM);
+        } else if cfg!(windows) && crate::platform::has_coreutil(b"xargs") {
             // Coreutils' xargs reads the list itself (-a): no shell, no quoting.
             let mut argv = vec![b"xargs".to_vec(), b"-0".to_vec(), b"-a".to_vec(), selpath];
             argv.extend(crate::popup::parseargs(cstr(cmd)).unwrap_or_default());
@@ -560,5 +630,89 @@ mod tests {
         assert_eq!(extract_dir_suggestion(b"/d/a.tar.gz"), b"a");
         assert_eq!(extract_dir_suggestion(b"/d/.a.tar"), b".a.tar");
         assert_eq!(extract_dir_suggestion(b"/d/ab"), b"ab");
+    }
+
+    #[test]
+    fn tar_list_argv_forms() {
+        assert_eq!(
+            tar_list_argv(b"tar -acvf", b"a.tar", b"l"),
+            Some(vec![
+                b"tar".to_vec(),
+                b"-acvf".to_vec(),
+                b"a.tar".to_vec(),
+                b"--null".to_vec(),
+                b"-T".to_vec(),
+                b"l".to_vec(),
+            ])
+        );
+        let full = tar_list_argv(b"C:/WINDOWS/System32/tar.exe -acvf", b"a.tar", b"l").unwrap();
+        assert_eq!(full[0], b"C:/WINDOWS/System32/tar.exe");
+        assert!(tar_list_argv(b"bsdtar -acvf", b"a.tar", b"l").is_some());
+        assert!(tar_list_argv(b"BSDTAR.EXE -acvf", b"a.tar", b"l").is_some());
+        assert_eq!(tar_list_argv(b"zip -r", b"a.zip", b"l"), None);
+        assert_eq!(tar_list_argv(b"atool -a", b"a.tar", b"l"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tar_list_argv_archives_odd_names() {
+        let dir = std::env::temp_dir().join(format!("nnn-tar-odd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = ["x y", "a&b", "ñandú.txt"];
+        for n in names {
+            std::fs::write(dir.join(n), b"data").unwrap();
+        }
+        let list_path = dir.join("list");
+        let entries: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+        let list_arg = crate::platform::bytes(list_path.as_os_str()).into_owned();
+        let cmd = windows_tar_cmd(std::env::var_os("SystemRoot").as_deref());
+        let argv = tar_selection_argv(&cmd, b"g.tar", &entries, &list_arg).unwrap();
+        let status = crate::platform::command(&argv, 1)
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
+        let out_dir = dir.join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+        let extract = crate::platform::command(
+            &[
+                argv[0].clone(),
+                b"-xf".to_vec(),
+                b"g.tar".to_vec(),
+                b"-C".to_vec(),
+                b"out".to_vec(),
+            ],
+            1,
+        )
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+        assert!(extract.success(), "{extract}");
+        for n in names {
+            assert_eq!(std::fs::read(out_dir.join(n)).unwrap(), b"data");
+        }
+        // `--null -T <list>` fallback also archives ASCII odd names without xargs/shell.
+        let ascii = ["x y", "a&b"];
+        std::fs::write(&list_path, ascii.join("\0").as_bytes()).unwrap();
+        let list_argv = tar_list_argv(&cmd, b"g2.tar", &list_arg).unwrap();
+        let status2 = crate::platform::command(&list_argv, 1)
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status2.success(), "{status2}");
+        let out2 = crate::platform::command(
+            &[list_argv[0].clone(), b"-tf".to_vec(), b"g2.tar".to_vec()],
+            1,
+        )
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+        assert!(out2.status.success());
+        let listed = String::from_utf8_lossy(&out2.stdout);
+        for n in ascii {
+            assert!(listed.lines().any(|l| l == n), "missing {n} in:\n{listed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
