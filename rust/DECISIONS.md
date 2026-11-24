@@ -144,10 +144,10 @@ Context: Some nnn features rest on Unix concepts, others on tools Windows lacks.
 Decision:
 - Unsupported, with nnn's own message: FIFO (the NNN_FIFO preview and selection feed), mounts (the mount/unmount key and FUSE archives), chmod (the permission editor).
 - Ctrl-C is a key as on Linux. Ctrl-Break is ignored, like SIGQUIT on Linux, so the console modes stay intact; closing the console window exits.
-- Git for Windows (sh.exe on PATH) is needed for sh-based plugins and for POSIX syntax in the shell and the command prompt; without it the shell and prompt fall back to `cmd /C` and plugins say "sh not found (Git for Windows)". Plain programs (editor, pager) run without it. The default opener is `cmd /C start ""`.
+- Git for Windows (sh.exe on PATH) is needed for sh-based plugins and for POSIX syntax in the shell and the command prompt; without it the shell and prompt fall back to `cmd /C` and plugins say "sh not found (Git for Windows)". Plain programs (editor, pager), duplicate and archiving a selection run without Git or Coreutils (ADR-029). The default opener is `cmd /C start ""`.
 - List mode (paths from stdin, built as a tree of symlinks) needs symlink rights: Developer Mode or an elevated shell.
 - Directory sizes, permission strings, link counts and the detail-mode octal column are NTFS approximations (ADR-027 wildcards them in screen cases).
-- No shared recorded case is filtered on Windows: all 242 replay cases pass; 12 of the 48 screen cases are marked unix-only because they need Unix tools or Unix file details (36 shared + 4 Windows-only cases run).
+- No shared recorded case is filtered on Windows: all 242 replay cases pass; 12 of the 48 screen cases are marked unix-only because they need Unix tools or Unix file details (36 shared + 6 Windows-only cases run without Coreutils; + 4 with Coreutils).
 Consequences: Config, session and selection file formats are unchanged (ADR-006). Windows-specific behaviour lives in rust/app-cases-windows and the Windows-only screen cases.
 
 ## ADR-025: Windows paths
@@ -160,7 +160,7 @@ Consequences: The `\\?\` form bypasses GetFullPathNameW normalisation (no `..` o
 Status: accepted (2026-11-24)
 Context: On Linux nnn runs cp, mv and rm (and xdg tools) from the shell; Windows has none of them without Git for Windows.
 Decision: rust/app/src/winops.rs does copy, move, remove, the file-information panel and directory-change polling natively. nnn's prompt texts are kept (overwrite, delete, "rm -rf" confirmations); the interactive answer to "rm -rf" (rm -ri on Linux) asks rm's own questions per entry ("rm: descend into directory 'd'?", "rm: remove regular file 'f'?"). A move across volumes onto an existing non-empty directory fails with "Directory not empty", as mv does; it never merges. Links are never followed and never replace a real directory; a tree is removed only after its prompt. File names are never put on a command line: they travel in environment variables (%NNN_CMD_ARGn%, `cmd /V:OFF`), so a name such as `a&calc.exe` cannot inject commands. Errors use glibc's strerror wording.
-Known differences from Linux: `rm -rf` of a read-only file fails with "Permission denied" (rm removes it); `rm -v` output quotes names with control characters differently from GNU rm; directory-change polling misses content-only changes.
+Known differences from Linux: `rm -v` output quotes names with control characters differently from GNU rm; directory-change polling misses content-only changes. (Rust std's `fs::remove_file` and `fs::remove_dir_all` already remove read-only files on Windows; ADR-029.)
 Consequences: Locked files and paths over 259 characters report an error, never panic.
 
 ## ADR-027: tui-check, the cross-platform screen harness
@@ -181,3 +181,14 @@ Decision:
 - rust/tui-check runs every case with `NNN_COREUTILS=0` except those with `"requires": ["coreutils"]`, which run only with `--coreutils` (otherwise `SKIP`).
 Known limits: `xargs` may split a long archive list into several `tar -acvf` runs, each overwriting the archive (as in the C original, but Windows' 32K command line reaches it at a few hundred paths). Known differences from Linux: prompts and messages carry `cp.exe:` (installed layout) or `cp:` (portable) and `\` in paths (`overwrite '.\Gamma'?`); the popup has no `file` lines (Coreutils has no `file`); `stat` shows Uid 0 and Gid `None`. A declined `cp -i` exits 1, as GNU cp does, so nnn shows "failed!" and keeps the selection. Still needing Git for Windows (ADR-024): sh plugins, batch rename, copy/move as, POSIX syntax in the shell and command prompt.
 Consequences: ADR-024's "Windows has none of them" and ADR-026's native operations now apply only without Coreutils (or with NNN_COREUTILS=0). Windows screen cases: 40 without Coreutils (4 skipped), 44 with it; CI runs both (jobs windows and windows-coreutils, the latter with the portable layout).
+
+## ADR-029: Hardening Windows file operations
+Status: accepted (2026-11-24)
+Context: On Windows without Git for Windows or Microsoft Coreutils, antivirus scanners and indexers briefly hold files open (causing spurious sharing/lock errors), duplicate (`Ctrl-R` → copy) silently did nothing because `cp` was missing, and archiving a selection failed because `xargs` was missing.
+Decision:
+- Busy-retry in `rust/app/src/winops.rs`: every `fs::copy`, `fs::rename`, `fs::remove_file`, `fs::remove_dir`, `fs::remove_dir_all` and `open_for_times` call retries Windows OS errors 32 (`ERROR_SHARING_VIOLATION`) and 33 (`ERROR_LOCK_VIOLATION`) up to 50 times, 10 ms apart (~0.5 s, following yazi's Windows remover). Every other error (missing file, ACL access denied) fails immediately with no wait; on Linux nothing is retried.
+- Native duplicate: `winops::copy_to` copies a file or directory tree (preserving modification times, refusing copying onto/inside itself with `EINVAL`, overwriting an existing file after nnn's confirmation). `browse.rs` uses it on Windows when Coreutils `cp` is not available, staying silent on failure as Linux's `F_SILENT` does.
+- Selection archiving with tar-family archivers (`tar`, `bsdtar`, case-insensitive, optional `.exe`) on Windows: `mounts.rs` skips `xargs` and the shell, running tar once directly. When the selected paths fit in 28,000 bytes (under `CreateProcessW`'s 32K limit), they are passed directly as UTF-16 argv (`<tar> <archive> -- <entries...>`) so Windows' `bsdtar` receives Unicode names without its `-T` ANSI-codepage limitation; oversized selections fall back to `tar_list_argv` (`<tar> <archive> --null -T <list>`). One tar invocation closes ADR-028's overwrite-per-batch limit for tar archives. Linux keeps the original `xargs` command byte-identical.
+- Read-only files: Rust std's `fs::remove_file` and `fs::remove_dir_all` already delete read-only files on Windows (pinned by unit tests); ADR-026's stale note claiming `rm -rf` failed with "Permission denied" is removed.
+- ADR-024's matrix is amended: duplicate and selection archiving work without Git or Coreutils.
+Consequences: Two new Windows screen cases (`win-duplicate`, `win-archive-sel`, both run with `PATH=C:\Windows\System32` and `NNN_COREUTILS=0`) pin the no-tool paths. Windows screen cases: 42 without Coreutils (4 skipped), 46 with it. Linux stays byte-identical (246/246 bytes, 48/48 tui).

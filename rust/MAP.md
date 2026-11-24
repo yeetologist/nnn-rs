@@ -1,6 +1,6 @@
 # nnn → Rust port map
 
-Goal: pure Rust `nnn` (default build) behaving as the C original. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..027; W7 adds 021-027). Terms: [GLOSSARY.md](GLOSSARY.md). Measured state: PORT_MAP.md (generated).
+Goal: pure Rust `nnn` (default build) behaving as the C original. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..029; W7 adds 021-027, W8 adds 028, W9 adds 029). Terms: [GLOSSARY.md](GLOSSARY.md). Measured state: PORT_MAP.md (generated).
 
 | Wave | Unit | State |
 |---|---|---|
@@ -12,6 +12,7 @@ Goal: pure Rust `nnn` (default build) behaving as the C original. Decisions: [DE
 | W6 | lift: fallback and kill switches removed, app-cases as cargo test (ADR-020) | done 2026-11-23: pure binary tui 48/48, replay 242/242, bytes 246/246, cargo test green, oracle 15/15 |
 | W7 | Windows: platform layer, console, portable locale, native file ops, tui-check, CI, ADR-021..027 | done 2026-11-24. Windows: replay 242/242, tui-check 40/40 (36 shared + 4 Windows-only; 12 unix-only skipped), cargo test 110 unit + 1 + 8 integration passed, clippy -D warnings and fmt clean. Linux: cargo test 91 unit + 242 app cases, replay 242/242, bytes 246/246, harness.py 48/48, tui-check 48/48 (Rust and C), function oracle 15 ok, portable-locale oracle (LOCALES=C.UTF-8, --features portable,oracles) 3/3 ok, clippy and fmt clean. CI: .github/workflows/ci.yml (linux, windows) |
 | W8 | Windows with Microsoft Coreutils: native PATH search (getutil), detection of the installed and portable layouts, cp/mv/rm/stat/xargs by absolute path, selection ops chunked to the command-line limit, Windows tar for archives, tui-check `requires`/`--coreutils`, CI job windows-coreutils, ADR-028 | done 2026-11-24. Windows with Coreutils: cargo test --include-ignored 144 unit + 1 + 8 passed, replay 242/242, tui-check --coreutils 44/44 (installed and portable layouts), clippy and fmt clean. Windows with NNN_COREUTILS=0: cargo test 140 passed (4 ignored), replay 242/242, tui-check 40/40 (4 skipped). Linux: cargo test 120 unit + 242 app cases, replay 242/242, bytes 246/246, harness.py 48/48, tui-check 48/48, function oracle 15 ok, clippy and fmt clean |
+| W9 | Windows winops hardening: busy-retry for sharing/lock violations (32/33, 50×10 ms), native duplicate (`winops::copy_to`), selection archiving without xargs/shell (`tar` direct UTF-16 argv + `--null -T` fallback), read-only delete pins, ADR-029 | done 2026-11-24. Windows with Coreutils: cargo test --include-ignored 159 unit + 1 + 8 passed, replay 242/242, tui-check --coreutils 46/46, clippy and fmt clean. Windows with NNN_COREUTILS=0: cargo test 155 passed (4 ignored), replay 242/242, tui-check 42/42 (4 skipped). Linux: cargo test 129 unit + 242 app cases, replay 242/242, bytes 246/246, harness.py 48/48, tui-check 48/48, function oracle 15 ok, clippy and fmt clean |
 
 Out of scope (ADR-003): icon builds, haiku, macos-legacy, PCRE build.
 
