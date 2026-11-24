@@ -1,14 +1,20 @@
 //! The Unix backend: byte paths are the OS's own bytes.
 
-use super::{DType, FileInfo};
+use super::{DType, Errno, FileInfo, FsBlocks, ReadResult, SignalStep};
+use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat};
+use rustix::termios::{OptionalActions, Termios};
 use std::borrow::Cow;
 use std::ffi::{OsStr, c_char};
-use std::fs::OpenOptions;
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Command, ExitStatus};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NULL_DEVICE: &[u8] = b"/dev/null";
 pub const TTY_DEVICE: &[u8] = b"/dev/tty";
@@ -181,6 +187,346 @@ pub fn raise_open_files_limit() {
     if below {
         rl.current = rl.maximum;
         let _ = setrlimit(Resource::Nofile, rl);
+    }
+}
+
+pub fn error(errno: Errno) -> io::Error {
+    io::Error::from_raw_os_error(raw_errno(errno))
+}
+
+fn raw_errno(errno: Errno) -> i32 {
+    match errno {
+        Errno::NoEnt => libc::ENOENT,
+        Errno::Exist => libc::EEXIST,
+        Errno::Inval => libc::EINVAL,
+        Errno::NameTooLong => libc::ENAMETOOLONG,
+        Errno::Io => libc::EIO,
+        Errno::Fault => libc::EFAULT,
+        Errno::NxIo => libc::ENXIO,
+    }
+}
+
+pub fn is_errno(e: &io::Error, n: Errno) -> bool {
+    e.raw_os_error() == Some(raw_errno(n))
+}
+
+pub fn access(path: &[u8], mode: super::Access) -> io::Result<()> {
+    use rustix::fs::Access as A;
+    let flags = match mode {
+        super::Access::Exists => A::EXISTS,
+        super::Access::Write => A::WRITE_OK,
+        super::Access::ReadWrite => A::READ_OK | A::WRITE_OK,
+        super::Access::Exec => A::EXEC_OK,
+    };
+    Ok(rustix::fs::access(&*os(path), flags)?)
+}
+
+pub fn mkdir(path: &[u8], mode: u32) -> io::Result<()> {
+    Ok(rustix::fs::mkdir(&*os(path), Mode::from_raw_mode(mode))?)
+}
+
+pub fn mkfifo(path: &[u8]) -> io::Result<()> {
+    Ok(rustix::fs::mknodat(
+        CWD,
+        &*os(path),
+        FileType::Fifo,
+        Mode::from_raw_mode(0o600),
+        0,
+    )?)
+}
+
+pub fn open_fifo_write(path: &[u8]) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&*os(path))?;
+    match f.metadata() {
+        Ok(m) if m.file_type().is_fifo() => Ok(f),
+        _ => Err(error(Errno::Inval)),
+    }
+}
+
+pub fn open_fifo_pair(path: &[u8]) -> (Option<File>, Option<File>) {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, open};
+    let rfd = open(
+        &*os(path),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok();
+    let wfd = rfd.as_ref().and_then(|_| {
+        open(
+            &*os(path),
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()
+    });
+    for fd in rfd.iter().chain(wfd.iter()) {
+        if let Ok(fl) = fcntl_getfl(fd) {
+            let _ = fcntl_setfl(fd, fl - OFlags::NONBLOCK);
+        }
+    }
+    (rfd.map(File::from), wfd.map(File::from))
+}
+
+pub fn stdin_to_tty() {
+    let stdout = rustix::stdio::stdout();
+    if !rustix::termios::isatty(stdout) {
+        if let Ok(fd) =
+            rustix::fs::open(&*os(TTY_DEVICE), OFlags::RDONLY, Mode::from_raw_mode(0o400))
+        {
+            let _ = rustix::stdio::dup2_stdin(fd.as_fd());
+        }
+    } else {
+        let _ = rustix::stdio::dup2_stdin(stdout);
+    }
+}
+
+pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
+    Ok(rustix::io::read(rustix::stdio::stdin(), buf)?)
+}
+
+pub fn parent_is_init() -> bool {
+    std::os::unix::process::parent_id() == 1
+}
+
+pub fn detach(cmd: &mut Command) {
+    cmd.process_group(0);
+}
+
+pub fn wait_status(st: ExitStatus) -> i32 {
+    st.code().unwrap_or_else(|| st.into_raw())
+}
+
+pub fn set_pipe_nonblocking(r: &io::PipeReader, w: &io::PipeWriter) {
+    for fd in [r.as_fd(), w.as_fd()] {
+        if let Ok(fl) = rustix::fs::fcntl_getfl(fd) {
+            let _ = rustix::fs::fcntl_setfl(fd, fl | OFlags::NONBLOCK);
+        }
+    }
+}
+
+pub fn fs_blocks(path: &[u8]) -> Option<FsBlocks> {
+    let svb = rustix::fs::statvfs(&*os(path)).ok()?;
+    Some(FsBlocks {
+        frsize: svb.f_frsize,
+        blocks: svb.f_blocks,
+        bfree: svb.f_bfree,
+        bavail: svb.f_bavail,
+    })
+}
+
+pub fn toggle_exec(path: &[u8]) -> Option<u32> {
+    let fd = rustix::fs::open(&*os(path), OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()).ok()?;
+    let sb = rustix::fs::fstat(&fd).ok()?;
+    let mut mode = sb.st_mode;
+    // (Un)set (S_IXUSR | S_IXGRP | S_IXOTH)
+    if mode & 0o100 != 0 {
+        mode &= !0o111;
+    } else {
+        mode |= 0o111;
+    }
+    rustix::fs::fchmod(&fd, Mode::from_bits_retain(mode & 0o7777)).ok()?;
+    Some(mode)
+}
+
+/// `INOTIFY_MASK`
+const INOTIFY_MASK: u32 = libc::IN_CREATE
+    | libc::IN_DELETE
+    | libc::IN_DELETE_SELF
+    | libc::IN_MODIFY
+    | libc::IN_MOVE_SELF
+    | libc::IN_MOVED_FROM
+    | libc::IN_MOVED_TO;
+/// `EVENT_BUF_LEN`: 32 slots of `struct inotify_event`.
+const EVENT_BUF_LEN: usize = 16 * 32;
+
+/// The directory watch (`inotify_fd` and `inotify_wd`, `None` for -1).
+pub struct DirWatch {
+    fd: OwnedFd,
+    wd: Option<i32>,
+}
+
+impl DirWatch {
+    /// `inotify_init1(IN_NONBLOCK | IN_CLOEXEC)`
+    pub fn new() -> io::Result<DirWatch> {
+        use rustix::fs::inotify::CreateFlags;
+        Ok(DirWatch {
+            fd: rustix::fs::inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC)?,
+            wd: None,
+        })
+    }
+
+    /// `inotify_wd = inotify_add_watch(inotify_fd, path, INOTIFY_MASK)`
+    pub fn watch(&mut self, path: &[u8]) {
+        self.wd = rustix::fs::inotify::add_watch(
+            &self.fd,
+            &*os(path),
+            rustix::fs::inotify::WatchFlags::from_bits_retain(INOTIFY_MASK),
+        )
+        .ok();
+    }
+
+    /// `inotify_rm_watch(inotify_fd, inotify_wd); inotify_wd = -1;`
+    pub fn unwatch(&mut self) {
+        if let Some(wd) = self.wd.take() {
+            let _ = rustix::fs::inotify::remove_watch(&self.fd, wd);
+        }
+    }
+
+    /// `inotify_wd >= 0`
+    pub fn is_watching(&self) -> bool {
+        self.wd.is_some()
+    }
+
+    /// The read of `nextsel()`: the watched directory changed.
+    pub fn changed(&mut self) -> bool {
+        if self.wd.is_none() {
+            return false;
+        }
+        let mut buf = [0u8; EVENT_BUF_LEN];
+        let Ok(n) = rustix::io::read(&self.fd, &mut buf) else {
+            return false;
+        };
+        let field = |at: usize| -> Option<u32> {
+            buf.get(at..at + 4)
+                .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let mut ptr = 0usize;
+        // for (ptr; ptr + ev->len < buf + i; ptr += sizeof(*ev) + ev->len)
+        while let Some(len) = field(ptr + 12) {
+            if ptr + len as usize >= n {
+                break;
+            }
+            let (Some(wd), Some(mask)) = (field(ptr), field(ptr + 4)) else {
+                return false;
+            };
+            if wd == 0 {
+                break;
+            }
+            if mask & INOTIFY_MASK != 0 {
+                return true;
+            }
+            ptr += 16 + len as usize;
+        }
+        false
+    }
+}
+
+pub fn register_signals(
+    int: Arc<AtomicBool>,
+    term: Arc<AtomicBool>,
+) -> Result<(), (SignalStep, io::Error)> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    use signal_hook::flag::register;
+    register(SIGINT, int).map_err(|e| (SignalStep::Interrupt, e))?;
+    for sig in [SIGTERM, SIGHUP] {
+        register(sig, term.clone()).map_err(|e| (SignalStep::Terminate, e))?;
+    }
+    // SIG_IGN: a handler that only sets a flag nobody reads.
+    register(SIGQUIT, Arc::new(AtomicBool::new(false))).map_err(|e| (SignalStep::Quit, e))?;
+    Ok(())
+}
+
+/// ncurses' modes: cbreak (ISIG kept, VMIN 1, VTIME 0), noecho, nonl.
+fn curses_modes(saved: &Termios) -> Termios {
+    use rustix::termios::{InputModes, LocalModes, SpecialCodeIndex};
+    let mut t = saved.clone();
+    t.local_modes &= !(LocalModes::ICANON | LocalModes::ECHO);
+    t.local_modes |= LocalModes::ISIG;
+    t.input_modes &= !InputModes::ICRNL;
+    t.special_codes[SpecialCodeIndex::VMIN] = 1;
+    t.special_codes[SpecialCodeIndex::VTIME] = 0;
+    t
+}
+
+/// The terminal on `/dev/stdin`; SIGWINCH sets `resized`.
+pub struct Term {
+    tty: File,
+    saved: Termios,
+    active: bool,
+    resized: Arc<AtomicBool>,
+}
+
+impl Term {
+    pub fn open() -> io::Result<Term> {
+        let tty = OpenOptions::new().read(true).open("/dev/stdin")?;
+        let saved = rustix::termios::tcgetattr(&tty)?;
+        rustix::termios::tcsetattr(&tty, OptionalActions::Drain, &curses_modes(&saved))?;
+        let resized = Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGWINCH, resized.clone());
+        Ok(Term {
+            tty,
+            saved,
+            active: true,
+            resized,
+        })
+    }
+
+    pub fn size(&self) -> (i32, i32) {
+        let ws = rustix::termios::tcgetwinsize(&self.tty).ok();
+        super::term_size(ws.map(|w| (i32::from(w.ws_row), i32::from(w.ws_col))))
+    }
+
+    /// Waits up to `wait_ms` (-1: no limit) for input; a SIGWINCH ends the wait.
+    pub fn read(&mut self, wait_ms: i32, out: &mut Vec<u8>) -> ReadResult {
+        let mut pfd = [PollFd::new(&self.tty, PollFlags::IN)];
+        let t = (wait_ms >= 0).then(|| Timespec {
+            tv_sec: i64::from(wait_ms / 1000),
+            tv_nsec: i64::from(wait_ms % 1000) * 1_000_000,
+        });
+        if let Ok(n) = rustix::event::poll(&mut pfd, t.as_ref())
+            && n > 0
+        {
+            let mut buf = [0u8; 256];
+            if let Ok(n) = (&self.tty).read(&mut buf)
+                && n > 0
+            {
+                out.extend_from_slice(&buf[..n]);
+                return ReadResult::Data;
+            }
+        }
+        if self.resized.load(Ordering::Relaxed) {
+            ReadResult::Resized
+        } else {
+            ReadResult::Timeout
+        }
+    }
+
+    /// A resize not reported yet.
+    pub fn resize_pending(&self) -> bool {
+        self.resized.load(Ordering::Relaxed)
+    }
+
+    pub fn set_resize_pending(&mut self, on: bool) {
+        self.resized.store(on, Ordering::Relaxed);
+    }
+
+    /// The saved modes back (`endwin`).
+    pub fn restore(&mut self) {
+        if self.active {
+            let _ = rustix::termios::tcsetattr(&self.tty, OptionalActions::Drain, &self.saved);
+            self.active = false;
+        }
+    }
+
+    /// Curses' modes again after `restore`.
+    pub fn resume(&mut self) {
+        if !self.active {
+            let _ = rustix::termios::tcsetattr(
+                &self.tty,
+                OptionalActions::Drain,
+                &curses_modes(&self.saved),
+            );
+            self.active = true;
+        }
+    }
+}
+
+impl Drop for Term {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 

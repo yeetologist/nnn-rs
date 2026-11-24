@@ -1,9 +1,10 @@
 //! The part of ncurses nnn uses (ADR-017): a virtual screen of cells, windows, attributes,
-//! diff-based refresh with ANSI sequences, ncurses' terminal modes (cbreak, noecho, nonl)
-//! and keypad decoding of raw input into curses key codes.
+//! diff-based refresh with ANSI sequences and keypad decoding of raw input into curses key
+//! codes. The terminal itself (modes, size, input, resizes) is `platform::Term`.
 
 use crate::locale;
-use std::io::{Read, Write};
+use crate::platform::{ReadResult, Term};
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 // Key codes (ncurses values).
@@ -104,8 +105,7 @@ pub struct Curses {
     overlays: Vec<Window>,
     front: Vec<Cell>,
     out: Box<dyn Write>,
-    tty_in: std::fs::File,
-    saved_termios: Option<rustix::termios::Termios>,
+    term: Box<dyn TermIo>,
     pending: Vec<u8>,
     ungot: Vec<i32>,
     timeout_ms: i32,
@@ -115,8 +115,43 @@ pub struct Curses {
     cursor_visible: bool,
     mouse: bool,
     last_mouse: MouseEvent,
-    pub resized: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ended: bool,
+}
+
+/// The terminal `Curses` draws on and reads keys from: `platform::Term`, or a test double.
+pub trait TermIo {
+    /// (lines, columns)
+    fn size(&self) -> (i32, i32);
+    /// Waits up to `wait_ms` (-1: no limit) for input and appends it to `out`.
+    fn read(&mut self, wait_ms: i32, out: &mut Vec<u8>) -> ReadResult;
+    /// A resize not reported yet (SIGWINCH on Unix).
+    fn resize_pending(&self) -> bool;
+    fn set_resize_pending(&mut self, on: bool);
+    /// The modes the terminal had before (`endwin`).
+    fn restore(&mut self);
+    /// Curses' modes again.
+    fn resume(&mut self);
+}
+
+impl TermIo for Term {
+    fn size(&self) -> (i32, i32) {
+        Term::size(self)
+    }
+    fn read(&mut self, wait_ms: i32, out: &mut Vec<u8>) -> ReadResult {
+        Term::read(self, wait_ms, out)
+    }
+    fn resize_pending(&self) -> bool {
+        Term::resize_pending(self)
+    }
+    fn set_resize_pending(&mut self, on: bool) {
+        Term::set_resize_pending(self, on);
+    }
+    fn restore(&mut self) {
+        Term::restore(self);
+    }
+    fn resume(&mut self) {
+        Term::resume(self);
+    }
 }
 
 /// Display width of one wide character (`wcwidth`), 1 for unprintables as ncurses shows them.
@@ -420,34 +455,24 @@ impl Curses {
     /// `initscr` (or `newterm(NULL, stderr, stdin)` in picker mode): the terminal goes to
     /// the alternate screen in ncurses' cbreak/noecho/nonl modes.
     pub fn init(to_stderr: bool) -> Option<Curses> {
-        let tty_in = std::fs::OpenOptions::new()
-            .read(true)
-            .open("/dev/stdin")
-            .ok()?;
-        let saved = rustix::termios::tcgetattr(&tty_in).ok()?;
-        let mut t = saved.clone();
-        use rustix::termios::{InputModes, LocalModes, SpecialCodeIndex};
-        t.local_modes &= !(LocalModes::ICANON | LocalModes::ECHO);
-        t.local_modes |= LocalModes::ISIG;
-        t.input_modes &= !InputModes::ICRNL;
-        t.special_codes[SpecialCodeIndex::VMIN] = 1;
-        t.special_codes[SpecialCodeIndex::VTIME] = 0;
-        rustix::termios::tcsetattr(&tty_in, rustix::termios::OptionalActions::Drain, &t).ok()?;
+        let term = Term::open().ok()?;
         let out: Box<dyn Write> = if to_stderr {
             Box::new(std::io::stderr())
         } else {
             Box::new(std::io::stdout())
         };
-        let (lines, cols) = Self::size(&tty_in);
-        let resized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGWINCH, resized.clone());
+        Some(Self::with_term(Box::new(term), out))
+    }
+
+    /// Curses on `term` (already in curses' modes), drawing to `out`.
+    pub fn with_term(term: Box<dyn TermIo>, out: Box<dyn Write>) -> Curses {
+        let (lines, cols) = term.size();
         let mut c = Curses {
             stdscr: Window::new(lines, cols, 0, 0),
             overlays: Vec::new(),
             front: Vec::new(),
             out,
-            tty_in,
-            saved_termios: Some(saved),
+            term,
             pending: Vec::new(),
             ungot: Vec::new(),
             timeout_ms: -1,
@@ -457,29 +482,11 @@ impl Curses {
             cursor_visible: true,
             mouse: false,
             last_mouse: MouseEvent::default(),
-            resized,
             ended: false,
         };
         c.emit("\x1b[?1049h\x1b[22;0;0t\x1b[?1h\x1b=\x1b[H\x1b[2J");
         c.front = vec![Cell::default(); (lines * cols) as usize];
-        Some(c)
-    }
-
-    fn size(fd: &std::fs::File) -> (i32, i32) {
-        let env = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse::<i32>().ok())
-                .filter(|&v| v > 0)
-        };
-        let ws = rustix::termios::tcgetwinsize(fd).ok();
-        let lines = env("LINES")
-            .or(ws.map(|w| i32::from(w.ws_row)).filter(|&v| v > 0))
-            .unwrap_or(24);
-        let cols = env("COLUMNS")
-            .or(ws.map(|w| i32::from(w.ws_col)).filter(|&v| v > 0))
-            .unwrap_or(80);
-        (lines, cols)
+        c
     }
 
     fn emit(&mut self, s: &str) {
@@ -643,13 +650,7 @@ impl Curses {
         }
         self.emit("\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1049l\x1b[23;0;0t");
         let _ = self.out.flush();
-        if let Some(t) = &self.saved_termios {
-            let _ = rustix::termios::tcsetattr(
-                &self.tty_in,
-                rustix::termios::OptionalActions::Drain,
-                t,
-            );
-        }
+        self.term.restore();
         self.ended = true;
     }
 
@@ -659,20 +660,7 @@ impl Curses {
             return;
         }
         self.ended = false;
-        if let Some(saved) = self.saved_termios.clone() {
-            let mut t = saved;
-            use rustix::termios::{InputModes, LocalModes, SpecialCodeIndex};
-            t.local_modes &= !(LocalModes::ICANON | LocalModes::ECHO);
-            t.local_modes |= LocalModes::ISIG;
-            t.input_modes &= !InputModes::ICRNL;
-            t.special_codes[SpecialCodeIndex::VMIN] = 1;
-            t.special_codes[SpecialCodeIndex::VTIME] = 0;
-            let _ = rustix::termios::tcsetattr(
-                &self.tty_in,
-                rustix::termios::OptionalActions::Drain,
-                &t,
-            );
-        }
+        self.term.resume();
         self.emit("\x1b[?1049h\x1b[?1h\x1b=");
         if self.mouse {
             self.emit("\x1b[?1000h\x1b[?1006h");
@@ -686,7 +674,7 @@ impl Curses {
     /// Resize to the terminal's current size, as ncurses does before it returns
     /// `KEY_RESIZE`: the contents are kept where they fit; everything is repainted.
     pub fn resize(&mut self) {
-        let (lines, cols) = Self::size(&self.tty_in);
+        let (lines, cols) = self.term.size();
         if (lines, cols) == (self.stdscr.lines, self.stdscr.cols) {
             return;
         }
@@ -715,30 +703,35 @@ impl Curses {
         self.ungot.push(c);
     }
 
+    /// Waits up to `wait_ms` for input into `pending`; false on timeout or a resize (which
+    /// stays pending until `get_wch` reports it).
     fn fill(&mut self, wait_ms: i32) -> bool {
-        let fd = &self.tty_in;
-        let mut pfd = [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
-        let t = if wait_ms < 0 {
-            None
-        } else {
-            Some(rustix::event::Timespec {
-                tv_sec: i64::from(wait_ms / 1000),
-                tv_nsec: i64::from(wait_ms % 1000) * 1_000_000,
-            })
-        };
-        match rustix::event::poll(&mut pfd, t.as_ref()) {
-            Ok(n) if n > 0 => {
-                let mut buf = [0u8; 256];
-                match (&self.tty_in).read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        self.pending.extend_from_slice(&buf[..n]);
-                        true
-                    }
-                    _ => false,
-                }
+        match self.term.read(wait_ms, &mut self.pending) {
+            ReadResult::Data => true,
+            ReadResult::Resized => {
+                self.term.set_resize_pending(true);
+                false
             }
-            _ => false,
+            ReadResult::Timeout => false,
         }
+    }
+
+    /// Takes the pending resize, if any.
+    fn take_resize(&mut self) -> bool {
+        let r = self.term.resize_pending();
+        if r {
+            self.term.set_resize_pending(false);
+        }
+        r
+    }
+
+    /// A resize not reported yet (`spawn` saves it and puts it back after the child).
+    pub fn resize_pending(&self) -> bool {
+        self.term.resize_pending()
+    }
+
+    pub fn set_resize_pending(&mut self, on: bool) {
+        self.term.set_resize_pending(on);
     }
 
     /// `get_wch`: a key code (`Key`), a character, or `None` on timeout.
@@ -750,24 +743,14 @@ impl Curses {
         if let Some(c) = self.ungot.pop() {
             return Some(Input::Key(c));
         }
-        if self
-            .resized
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            {
-                self.resize();
-                return Some(Input::Key(KEY_RESIZE));
-            }
+        if self.take_resize() {
+            self.resize();
+            return Some(Input::Key(KEY_RESIZE));
         }
         if self.pending.is_empty() && !self.fill(self.timeout_ms) {
-            if self
-                .resized
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
-            {
-                {
-                    self.resize();
-                    return Some(Input::Key(KEY_RESIZE));
-                }
+            if self.take_resize() {
+                self.resize();
+                return Some(Input::Key(KEY_RESIZE));
             }
             return None;
         }
@@ -953,5 +936,52 @@ mod tests {
         ));
         assert!(matches!(decode_escape(b"\x1b["), Decoded::Incomplete));
         assert!(matches!(decode_escape(b"\x1bx"), Decoded::NotEscape));
+    }
+
+    /// A terminal that plays a script of reads; a resize makes it 30x100.
+    struct FakeTerm {
+        script: std::collections::VecDeque<(ReadResult, &'static [u8])>,
+        size: (i32, i32),
+        resize_pending: bool,
+    }
+
+    impl TermIo for FakeTerm {
+        fn size(&self) -> (i32, i32) {
+            self.size
+        }
+        fn read(&mut self, _wait_ms: i32, out: &mut Vec<u8>) -> ReadResult {
+            let Some((r, bytes)) = self.script.pop_front() else {
+                return ReadResult::Timeout;
+            };
+            if r == ReadResult::Resized {
+                self.size = (30, 100);
+                self.resize_pending = true;
+            }
+            out.extend_from_slice(bytes);
+            r
+        }
+        fn resize_pending(&self) -> bool {
+            self.resize_pending
+        }
+        fn set_resize_pending(&mut self, on: bool) {
+            self.resize_pending = on;
+        }
+        fn restore(&mut self) {}
+        fn resume(&mut self) {}
+    }
+
+    #[test]
+    fn resize_event_becomes_key_resize() {
+        let term = FakeTerm {
+            script: [(ReadResult::Resized, &b""[..]), (ReadResult::Data, b"q")].into(),
+            size: (24, 80),
+            resize_pending: false,
+        };
+        let mut cs = Curses::with_term(Box::new(term), Box::new(std::io::sink()));
+        assert_eq!((cs.lines(), cs.cols()), (24, 80));
+        assert_eq!(cs.get_wch(), Some(Input::Key(KEY_RESIZE)));
+        assert_eq!((cs.lines(), cs.cols()), (30, 100));
+        assert_eq!(cs.get_wch(), Some(Input::Char(i32::from(b'q'))));
+        assert_eq!(cs.get_wch(), None);
     }
 }

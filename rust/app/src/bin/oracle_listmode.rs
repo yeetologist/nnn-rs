@@ -29,7 +29,7 @@ fn main() -> ExitCode {
         ..Nnn::default()
     };
     let cwd = args.get(1).filter(|c| !c.is_empty()).cloned();
-    let ret = n.load_input(rustix::stdio::stdin(), cwd.as_deref());
+    let ret = n.load_input(&mut std::io::stdin(), cwd.as_deref());
     put("ret", ret.as_deref());
     put("listroot", n.listroot.as_deref());
     put("listpath", n.listpath.as_deref());

@@ -2,12 +2,11 @@
 //! write_lastdir, and the path helpers of src/nnn.c (mkpath, xdirname, xbasename,
 //! common_prefix, get_cwd_entry, is_suffix, is_prefix).
 
-use crate::platform::{self, Os, path};
+use crate::platform::{self, Errno, Os, path};
 use crate::state::{Kv, Nnn, PATH_MAX};
 use crate::sys;
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 /// `CMD_LEN_MAX`: the size of `g_buf`.
 pub const CMD_LEN_MAX: usize = PATH_MAX + ((crate::state::NAME_MAX + 1) << 1);
@@ -227,8 +226,8 @@ pub fn bmtarget(filepath: &[u8], cwd: &[u8], home: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn mkdir(p: &[u8]) -> io::Result<()> {
-    match DirBuilder::new().mode(0o777).create(path(p)) {
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+    match platform::mkdir(p, 0o777) {
+        Err(e) if platform::is_errno(&e, Errno::Exist) => Ok(()),
         r => r,
     }
 }
@@ -237,7 +236,7 @@ fn mkdir(p: &[u8]) -> io::Result<()> {
 pub fn xmktree_io(p: &[u8], dir: bool, tree: bool) -> io::Result<()> {
     let p = cstr(p);
     if p.is_empty() {
-        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        return Err(platform::error(Errno::NoEnt));
     }
     if tree {
         // Skip the first '/'
@@ -248,14 +247,10 @@ pub fn xmktree_io(p: &[u8], dir: bool, tree: bool) -> io::Result<()> {
     if dir {
         mkdir(p)
     } else {
-        match OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        match platform::private_mode(OpenOptions::new().write(true).create(true).truncate(true))
             .open(path(p))
         {
-            Err(e) if e.raw_os_error() != Some(libc::EEXIST) => Err(e),
+            Err(e) if !platform::is_errno(&e, Errno::Exist) => Err(e),
             _ => Ok(()),
         }
     }
@@ -303,20 +298,16 @@ pub fn write_lastdir_file(
         None => mkpath(cfgpath, b".lastd", home).0,
         Some(o) => convert_tilde(o, home).unwrap_or_else(|| cstr(o).to_vec()),
     };
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut f = platform::private_mode(OpenOptions::new().write(true).create(true).truncate(true))
         .open(path(&target))?;
     let Some(esc) = shell_escape(curpath, CMD_LEN_MAX - 3) else {
-        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        return Err(platform::error(Errno::NameTooLong));
     };
     let mut buf = b"cd ".to_vec();
     buf.extend_from_slice(&esc);
     match f.write(&buf) {
         Ok(n) if n == buf.len() => Ok(()),
-        Ok(_) => Err(io::Error::from_raw_os_error(libc::EIO)),
+        Ok(_) => Err(platform::error(Errno::Io)),
         Err(e) => Err(e),
     }
 }
@@ -524,11 +515,7 @@ impl Nnn {
             } else {
                 x
             };
-            if let Err(e) = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY)
-                .open(path(&x))
-            {
+            if let Err(e) = platform::Dir::open(&x) {
                 sys::xerror(10336, &e);
                 return false;
             }
@@ -600,6 +587,8 @@ mod tests {
         assert!(!parsekvpair(Some(b"a:")).0);
         assert!(!parsekvpair(Some(b"ab")).0);
         let kvs = parsekvpair(Some(b"a:/x;b:~/y;p:plug")).1;
+        // "/h" is a root only on Unix.
+        #[cfg(unix)]
         assert_eq!(
             get_kv_val(&kvs, i32::from(b'b'), NNN_BMS, b"/h").unwrap(),
             b"/h/y"
@@ -617,8 +606,9 @@ mod tests {
         assert_eq!(out, b" a: /x\n b: ~/y\n p: plug\n");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn paths() {
+    fn unix_paths() {
         assert_eq!(mkpath(b"/", b"a", b"/h"), (b"/a".to_vec(), 3));
         assert_eq!(mkpath(b"/x", b"a", b"/h"), (b"/x/a".to_vec(), 5));
         assert_eq!(mkpath(b"/x", b"/a", b"/h"), (b"/a".to_vec(), 3));
@@ -634,6 +624,10 @@ mod tests {
         assert!(common_prefix(b"/q", &mut p));
         assert_eq!(p, b"/q");
         assert!(!common_prefix(b"", &mut p));
+    }
+
+    #[test]
+    fn paths() {
         assert_eq!(get_cwd_entry(b"/a", b"/a/bc/d"), Some((3, 2)));
         let mut p = b"C:/a/b".to_vec();
         assert!(common_prefix_with(Os::Windows, b"C:/a/c", &mut p));

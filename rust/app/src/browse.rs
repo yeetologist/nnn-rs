@@ -18,6 +18,7 @@ use crate::fmt::coolsize;
 use crate::keys::Action;
 use crate::locale::Regex;
 use crate::opts::Opts;
+use crate::platform::{self, Access, Errno};
 use crate::popup::{
     F_CHKRTN, F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, F_SILENT, xchartohex,
     xgetenv,
@@ -27,8 +28,6 @@ use crate::sort::{DIR_OR_DIRLNK, Entry, FILE_SELECTED, TimeType};
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX};
 use crate::sys;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -70,17 +69,6 @@ pub const C_UND: usize = C_BLK + 11;
 const GCOLORS: &[u8] = b"c1e2272e006033f7c6d6abc4";
 /// `COLOR_256`
 const COLOR_256: i32 = 256;
-
-/// `INOTIFY_MASK`
-const INOTIFY_MASK: u32 = libc::IN_CREATE
-    | libc::IN_DELETE
-    | libc::IN_DELETE_SELF
-    | libc::IN_MODIFY
-    | libc::IN_MOVE_SELF
-    | libc::IN_MOVED_FROM
-    | libc::IN_MOVED_TO;
-/// `EVENT_BUF_LEN`: 32 slots of `struct inotify_event`.
-const EVENT_BUF_LEN: usize = 16 * 32;
 
 /// `MIN_PREVIEW_COLS`
 const MIN_PREVIEW_COLS: i32 = 40;
@@ -182,10 +170,8 @@ pub const MESSAGES: [&[u8]; 45] = [
 /// FIFO/inotify/preview code use.
 #[derive(Default)]
 pub struct BrowseState {
-    /// `inotify_fd`
-    pub inotify_fd: Option<OwnedFd>,
-    /// `inotify_wd` (`None` is -1).
-    pub inotify_wd: Option<i32>,
+    /// `inotify_fd` and `inotify_wd`.
+    pub dir_watch: Option<platform::DirWatch>,
     /// `fifofd` (`None` is -1).
     pub fifofd: Option<std::fs::File>,
     /// notify_fifo()'s `static struct entry lastentry`.
@@ -272,7 +258,7 @@ fn ncpy(src: &[u8], n: usize) -> Vec<u8> {
 }
 
 fn is_lnk(mode: u32) -> bool {
-    mode & libc::S_IFMT == libc::S_IFLNK
+    mode & platform::S_IFMT == 0o120000
 }
 
 /// `getenv`
@@ -299,11 +285,7 @@ fn xitoa(v: bool) -> &'static [u8] {
 
 /// `xdiraccess`: the path opens as a directory.
 pub fn xdiraccess(p: &[u8]) -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(os(p))
-        .is_ok()
+    platform::Dir::open(p).is_ok()
 }
 
 /// `xextension(fname, len)`: from the last '.', if any.
@@ -483,30 +465,25 @@ pub fn parse_fcolors(f_colors: &[u8], fcolors: &mut [u32]) -> bool {
 /// The NNN_FIFO checks of main(): create it (one that exists is fine); it must be a FIFO
 /// we may write to. Err holds the exit code, after the error message.
 fn make_fifo(fp: &[u8]) -> Result<(), u8> {
-    if let Err(e) = rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &*os(fp),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::from_raw_mode(0o600),
-        0,
-    ) && e != rustix::io::Errno::EXIST
+    if let Err(e) = platform::mkfifo(fp)
+        && !platform::is_errno(&e, Errno::Exist)
     {
-        sys::xerror(10910, &e.into());
+        sys::xerror(10910, &e);
         return Err(1);
     }
-    match std::fs::symlink_metadata(os(fp)) {
+    match platform::stat(fp, false) {
         Err(e) => {
             sys::xerror(10914, &e);
             return Err(1);
         }
-        Ok(sb) if !sb.file_type().is_fifo() => {
-            sys::xerror(10919, &std::io::Error::from_raw_os_error(libc::EINVAL));
+        Ok(sb) if sb.mode & platform::S_IFMT != platform::S_IFIFO => {
+            sys::xerror(10919, &platform::error(Errno::Inval));
             return Err(1);
         }
         Ok(_) => {}
     }
-    if let Err(e) = rustix::fs::access(&*os(fp), rustix::fs::Access::WRITE_OK) {
-        sys::xerror(10923, &e.into());
+    if let Err(e) = platform::access(fp, Access::Write) {
+        sys::xerror(10923, &e);
         return Err(1);
     }
     Ok(())
@@ -741,12 +718,10 @@ impl Nnn {
         // SIGPIPE: the Rust runtime already ignores it.
 
         // inotify
-        match rustix::fs::inotify::init(
-            rustix::fs::inotify::CreateFlags::NONBLOCK | rustix::fs::inotify::CreateFlags::CLOEXEC,
-        ) {
-            Ok(fd) => self.browse.inotify_fd = Some(fd),
+        match platform::DirWatch::new() {
+            Ok(w) => self.browse.dir_watch = Some(w),
             Err(e) => {
-                sys::xerror(10935, &e.into());
+                sys::xerror(10935, &e);
                 return 1;
             }
         }
@@ -759,24 +734,15 @@ impl Nnn {
         });
 
         // Signals: SIGINT sets the interrupt flag, SIGTERM/SIGHUP exit cleanly.
-        if let Err(e) =
-            signal_hook::flag::register(signal_hook::consts::SIGINT, self.browse.sigint.clone())
+        if let Err((step, e)) =
+            platform::register_signals(self.browse.sigint.clone(), self.browse.sigterm.clone())
         {
-            sys::xerror(10965, &e);
-            return 1;
-        }
-        for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
-            if let Err(e) = signal_hook::flag::register(sig, self.browse.sigterm.clone()) {
-                sys::xerror(10972, &e);
-                return 1;
-            }
-        }
-        // SIG_IGN: a handler that only sets a flag nobody reads.
-        if let Err(e) = signal_hook::flag::register(
-            signal_hook::consts::SIGQUIT,
-            Arc::new(AtomicBool::new(false)),
-        ) {
-            sys::xerror(10979, &e);
+            let line = match step {
+                platform::SignalStep::Interrupt => 10965,
+                platform::SignalStep::Terminate => 10972,
+                platform::SignalStep::Quit => 10979,
+            };
+            sys::xerror(line, &e);
             return 1;
         }
 
@@ -832,12 +798,13 @@ impl Nnn {
                 let sep = if self.browse.sepnul { 0 } else { b'\n' };
                 let want = self.pselbuf.len();
                 match self.selpath.clone() {
-                    Some(sp) => match std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(os(&sp))
+                    Some(sp) => match platform::private_mode(
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true),
+                    )
+                    .open(os(&sp))
                     {
                         Ok(mut f) => {
                             if self.seltofile(&mut f, sep).0 != want {
@@ -868,7 +835,7 @@ impl Nnn {
 
         // Shut down inotify.
         self.unwatch();
-        self.browse.inotify_fd = None;
+        self.browse.dir_watch = None;
 
         if !self.g_state.fifomode {
             self.notify_fifo(false);
@@ -1044,67 +1011,38 @@ impl Nnn {
     /// The LINUX_INOTIFY read in `nextsel()` (nextsel checks du mode and odd idle seconds):
     /// `Some(handle_event())` when the watched directory changed.
     pub fn poll_dir_watch(&mut self) -> Option<i32> {
-        self.browse.inotify_wd?;
-        let fd = self.browse.inotify_fd.as_ref()?;
-        let mut buf = [0u8; EVENT_BUF_LEN];
-        let n = rustix::io::read(fd, &mut buf).ok()?;
-        let field = |at: usize| -> Option<u32> {
-            buf.get(at..at + 4)
-                .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-        };
-        let mut ptr = 0usize;
-        // for (ptr; ptr + ev->len < buf + i; ptr += sizeof(*ev) + ev->len)
-        while let Some(len) = field(ptr + 12) {
-            if ptr + len as usize >= n {
-                break;
-            }
-            let wd = field(ptr)?;
-            let mask = field(ptr + 4)?;
-            if wd == 0 {
-                break;
-            }
-            if mask & INOTIFY_MASK != 0 {
-                return Some(self.handle_event());
-            }
-            ptr += 16 + len as usize;
-        }
-        None
+        let changed = self.browse.dir_watch.as_mut()?.changed();
+        changed.then(|| self.handle_event())
+    }
+
+    /// `inotify_wd >= 0`
+    fn watching(&self) -> bool {
+        self.browse
+            .dir_watch
+            .as_ref()
+            .is_some_and(platform::DirWatch::is_watching)
     }
 
     /// `inotify_rm_watch(inotify_fd, inotify_wd); inotify_wd = -1;`
     fn unwatch(&mut self) {
-        if let Some(wd) = self.browse.inotify_wd.take()
-            && let Some(fd) = &self.browse.inotify_fd
-        {
-            let _ = rustix::fs::inotify::remove_watch(fd, wd);
+        if let Some(w) = self.browse.dir_watch.as_mut() {
+            w.unwatch();
         }
     }
 
     /// `inotify_wd = inotify_add_watch(inotify_fd, path, INOTIFY_MASK)`
     fn watch(&mut self, path: &[u8]) {
-        if let Some(fd) = &self.browse.inotify_fd {
-            self.browse.inotify_wd = rustix::fs::inotify::add_watch(
-                fd,
-                &*os(path),
-                rustix::fs::inotify::WatchFlags::from_bits_retain(INOTIFY_MASK),
-            )
-            .ok();
+        if let Some(w) = self.browse.dir_watch.as_mut() {
+            w.watch(path);
         }
     }
 
     /// `open_fifo`: NNN_FIFO opened to write without blocking; it must be a FIFO.
     pub fn open_fifo(&self) -> std::io::Result<std::fs::File> {
         let Some(fp) = &self.fifopath else {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+            return Err(platform::error(Errno::NoEnt));
         };
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(os(fp))?;
-        match f.metadata() {
-            Ok(m) if m.file_type().is_fifo() => Ok(f),
-            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
-        }
+        platform::open_fifo_write(fp)
     }
 
     /// `notify_fifo`: the hovered path to NNN_FIFO, when it changed or with `force`.
@@ -1116,7 +1054,7 @@ impl Nnn {
             match self.open_fifo() {
                 Ok(f) => self.browse.fifofd = Some(f),
                 Err(e) => {
-                    if e.raw_os_error() != Some(libc::ENXIO) {
+                    if !platform::is_errno(&e, Errno::NxIo) {
                         // The FIFO may be gone: give up notifying.
                         self.fifopath = None;
                     }
@@ -1241,7 +1179,7 @@ impl Nnn {
             self.browse.previewer = Some(mkpath(&self.plgpath, UTIL_NPREVIEW, &self.home).0);
         }
         if let Some(previewer) = self.browse.previewer.clone()
-            && rustix::fs::access(&*os(&previewer), rustix::fs::Access::EXEC_OK).is_ok()
+            && platform::access(&previewer, Access::Exec).is_ok()
         {
             // spawn_redirected(): stdout and stderr into a pipe.
             let Ok((reader, writer)) = std::io::pipe() else {
@@ -1571,7 +1509,7 @@ impl Nnn {
         let path = self.cpath();
         self.xterm_cfg(&path);
 
-        if (b.presel == FILTER || b.watch) && self.browse.inotify_wd.is_some() {
+        if (b.presel == FILTER || b.watch) && self.watching() {
             self.unwatch();
             b.watch = false;
         }
@@ -1609,7 +1547,7 @@ impl Nnn {
             b.presel = control(b'L');
         }
 
-        if b.presel != FILTER && self.browse.inotify_wd.is_none() {
+        if b.presel != FILTER && !self.watching() {
             self.watch(&path);
         }
         Flow::Top
@@ -1618,7 +1556,7 @@ impl Nnn {
     /// `nochange:` in browse(): the checks, the next key, the switch on its action.
     fn browse_nochange(&mut self, b: &mut Locals) -> Flow {
         // Exit if the parent has exited.
-        if std::os::unix::process::parent_id() == 1 {
+        if platform::parent_is_init() {
             std::process::exit(1);
         }
         self.check_clean_exit();
@@ -2404,8 +2342,8 @@ impl Nnn {
             self.startselection();
             self.g_state.rangesel = !self.g_state.rangesel;
             let path = self.cpath();
-            let ino = match std::fs::metadata(os(&path)) {
-                Ok(sb) => sb.ino(),
+            let ino = match platform::stat(&path, true) {
+                Ok(sb) => sb.ino,
                 Err(_) => return Flow::WarnNochange,
             };
             if self.g_state.rangesel {
@@ -2872,7 +2810,7 @@ impl Nnn {
     /// `plugscript`: run a plugin of the plugin dir if it is executable.
     pub fn plugscript(&mut self, plugin: &[u8], flags: u16) -> bool {
         let (p, _) = mkpath(&self.plgpath, plugin, &self.home);
-        if rustix::fs::access(&*os(&p), rustix::fs::Access::EXEC_OK).is_ok() {
+        if platform::access(&p, Access::Exec).is_ok() {
             self.spawn(&p, None, None, None, flags);
             return true;
         }
@@ -2999,7 +2937,10 @@ impl Nnn {
         }
         let link = |src: &[u8], dst: &[u8]| {
             if ty == i32::from(b's') {
-                std::os::unix::fs::symlink(os(src), os(dst))
+                let is_dir = cfg!(windows)
+                    && platform::stat(src, true)
+                        .is_ok_and(|i| i.mode & platform::S_IFMT == platform::S_IFDIR);
+                platform::symlink(src, dst, is_dir)
             } else {
                 std::fs::hard_link(os(src), os(dst))
             }
@@ -3134,6 +3075,8 @@ mod tests {
         assert_eq!(fgets(&mut r).unwrap(), b"y");
     }
 
+    // W7 Task 6: NNN_FIFO on Windows.
+    #[cfg(unix)]
     #[test]
     fn fifo_checks() {
         let dir = std::env::temp_dir().join(format!("nnn-fifo-test-{}", std::process::id()));

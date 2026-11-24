@@ -8,6 +8,8 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[cfg(any(windows, feature = "portable"))]
 pub(crate) mod portable_locale;
@@ -215,6 +217,178 @@ pub fn setenv(name: &str, value: &[u8]) {
 /// `unsetenv(name)`.
 pub fn unsetenv(name: &str) {
     backend::unsetenv(name);
+}
+
+/// `S_IFMT`, `S_IFIFO` and `S_IFDIR` of `FileInfo::mode`.
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFIFO: u32 = 0o010000;
+pub const S_IFDIR: u32 = 0o040000;
+
+/// The `errno` values nnn reports itself (not as a system call's result).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Errno {
+    NoEnt,
+    Exist,
+    Inval,
+    NameTooLong,
+    Io,
+    Fault,
+    NxIo,
+}
+
+/// The error for `errno` (Unix: the OS's own; Windows: glibc's words, so `strerror` matches).
+pub fn error(errno: Errno) -> io::Error {
+    backend::error(errno)
+}
+
+/// `errno == n` for an error a system call returned.
+pub fn is_errno(e: &io::Error, n: Errno) -> bool {
+    backend::is_errno(e, n)
+}
+
+/// The checks of `access(2)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Exists,
+    Write,
+    ReadWrite,
+    Exec,
+}
+
+/// `access(path, mode)`.
+pub fn access(path: &[u8], mode: Access) -> io::Result<()> {
+    backend::access(path, mode)
+}
+
+/// `mkdir(path, mode)` (the mode is Unix-only).
+pub fn mkdir(path: &[u8], mode: u32) -> io::Result<()> {
+    backend::mkdir(path, mode)
+}
+
+/// `mkfifo(path, 0600)`.
+pub fn mkfifo(path: &[u8]) -> io::Result<()> {
+    backend::mkfifo(path)
+}
+
+/// The FIFO at `path` opened to write without blocking and without following a link; it
+/// must be a FIFO (`EINVAL` otherwise).
+pub fn open_fifo_write(path: &[u8]) -> io::Result<std::fs::File> {
+    backend::open_fifo_write(path)
+}
+
+/// Both ends of the FIFO at `path`, opened as `run_plugin` does: the read end first without
+/// blocking (so opening the write end succeeds), the write end only if that worked; both block
+/// afterwards.
+pub fn open_fifo_pair(path: &[u8]) -> (Option<std::fs::File>, Option<std::fs::File>) {
+    backend::open_fifo_pair(path)
+}
+
+/// Makes the controlling terminal stdin again after a list was read from it (list mode).
+pub fn stdin_to_tty() {
+    backend::stdin_to_tty();
+}
+
+/// `read(STDIN_FILENO, buf, len)`: one unbuffered read.
+pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
+    backend::read_stdin(buf)
+}
+
+/// `getppid() == 1`: the parent has exited.
+pub fn parent_is_init() -> bool {
+    backend::parent_is_init()
+}
+
+/// Starts `cmd` in its own process group (`setsid` in the original's grandchild).
+pub fn detach(cmd: &mut std::process::Command) {
+    backend::detach(cmd);
+}
+
+/// The exit status of a child, or the raw wait status when it did not exit.
+pub fn wait_status(st: std::process::ExitStatus) -> i32 {
+    backend::wait_status(st)
+}
+
+/// Both ends of a pipe set to `O_NONBLOCK`.
+pub fn set_pipe_nonblocking(r: &io::PipeReader, w: &io::PipeWriter) {
+    backend::set_pipe_nonblocking(r, w);
+}
+
+/// The `statvfs` fields `get_fs_info` uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FsBlocks {
+    pub frsize: u64,
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+}
+
+/// `statvfs(path)`.
+pub fn fs_blocks(path: &[u8]) -> Option<FsBlocks> {
+    backend::fs_blocks(path)
+}
+
+/// `xchmod`'s system calls: toggles the execute bits of `path` (not following a link):
+/// all three off if the owner's is set, else all three on. The new mode, if it changed.
+pub fn toggle_exec(path: &[u8]) -> Option<u32> {
+    backend::toggle_exec(path)
+}
+
+pub use backend::DirWatch;
+
+/// Which registration of `register_signals` failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalStep {
+    Interrupt,
+    Terminate,
+    Quit,
+}
+
+/// The signals nnn handles: `int` is set on SIGINT, `term` on SIGTERM (and SIGHUP); SIGQUIT is
+/// ignored. SIGWINCH belongs to `Term`.
+pub fn register_signals(
+    int: Arc<AtomicBool>,
+    term: Arc<AtomicBool>,
+) -> Result<(), (SignalStep, io::Error)> {
+    backend::register_signals(int, term)
+}
+
+/// What `Term::read` got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadResult {
+    /// Bytes were appended to the buffer.
+    Data,
+    /// The terminal changed size (and nothing was read).
+    Resized,
+    /// Nothing arrived in time.
+    Timeout,
+}
+
+/// The terminal in curses' modes (Unix: cbreak, noecho, nonl on stdin; Windows: the console in
+/// VT input and output modes, UTF-8 code pages). Dropping it restores the saved modes.
+pub use backend::Term;
+
+/// The screen size: `LINES`/`COLUMNS` win over what the terminal reports (`ws`, lines and
+/// columns, 0 when unknown); 24x80 when neither is there.
+fn term_size(ws: Option<(i32, i32)>) -> (i32, i32) {
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&v| v > 0)
+    };
+    let lines = env("LINES")
+        .or(ws.map(|w| w.0).filter(|&v| v > 0))
+        .unwrap_or(24);
+    let cols = env("COLUMNS")
+        .or(ws.map(|w| w.1).filter(|&v| v > 0))
+        .unwrap_or(80);
+    (lines, cols)
+}
+
+/// The console's input and output modes (for checking that `Term` restores them).
+#[cfg(windows)]
+pub fn console_modes() -> Option<(u32, u32)> {
+    backend::console_modes()
 }
 
 #[cfg(test)]

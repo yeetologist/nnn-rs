@@ -1,19 +1,33 @@
 //! The Windows backend: byte paths are WTF-8 (`OsStr::as_encoded_bytes`), shown with `/`.
 
-use super::{DType, FileInfo};
+use super::{Access, DType, Errno, FileInfo, FsBlocks, ReadResult, SignalStep};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_STANDARD_INFO, FileBasicInfo,
     FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
+use windows_sys::Win32::System::Console::{
+    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_PROCESSED_INPUT,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
+    GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetStdHandle,
+    INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP, SetStdHandle,
+    WINDOW_BUFFER_SIZE_EVENT,
+};
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 
 pub const NULL_DEVICE: &[u8] = b"NUL";
 pub const TTY_DEVICE: &[u8] = b"CONIN$";
@@ -303,6 +317,357 @@ pub fn setenv(name: &str, value: &[u8]) {
 pub fn unsetenv(name: &str) {
     // SAFETY: as for setenv.
     unsafe { std::env::remove_var(name) };
+}
+
+pub fn error(errno: Errno) -> io::Error {
+    use io::ErrorKind as K;
+    let (kind, text) = match errno {
+        Errno::NoEnt => (K::NotFound, "No such file or directory"),
+        Errno::Exist => (K::AlreadyExists, "File exists"),
+        Errno::Inval => (K::InvalidInput, "Invalid argument"),
+        Errno::NameTooLong => (K::InvalidFilename, "File name too long"),
+        Errno::Io => (K::Other, "Input/output error"),
+        Errno::Fault => (K::Other, "Bad address"),
+        Errno::NxIo => (K::Other, "No such device or address"),
+    };
+    io::Error::new(kind, text)
+}
+
+pub fn is_errno(e: &io::Error, n: Errno) -> bool {
+    use io::ErrorKind as K;
+    match n {
+        Errno::NoEnt => e.kind() == K::NotFound,
+        Errno::Exist => e.kind() == K::AlreadyExists,
+        Errno::Inval => e.kind() == K::InvalidInput,
+        Errno::NameTooLong => e.kind() == K::InvalidFilename,
+        Errno::Io | Errno::Fault | Errno::NxIo => false,
+    }
+}
+
+/// `access` from the synthesized mode: write needs no read-only attribute, exec a name the
+/// shell runs.
+pub fn access(path: &[u8], mode: Access) -> io::Result<()> {
+    let m = stat(path, true)?.mode;
+    let ok = match mode {
+        Access::Exists => true,
+        Access::Write | Access::ReadWrite => m & 0o200 != 0,
+        Access::Exec => m & 0o111 != 0,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+pub fn mkdir(path: &[u8], _mode: u32) -> io::Result<()> {
+    std::fs::create_dir(super::path(path))
+}
+
+// W7 Task 6: NNN_FIFO and the plugin control pipe on Windows.
+pub fn mkfifo(_path: &[u8]) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+// W7 Task 6
+pub fn open_fifo_write(_path: &[u8]) -> io::Result<File> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+// W7 Task 6
+pub fn open_fifo_pair(_path: &[u8]) -> (Option<File>, Option<File>) {
+    (None, None)
+}
+
+/// The console input (`CONIN$`) becomes the standard input.
+pub fn stdin_to_tty() {
+    let Ok(conin) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&*os(TTY_DEVICE))
+    else {
+        return;
+    };
+    let handle = conin.into_raw_handle();
+    // SAFETY: handle is an open console handle this process owns from now on (never closed),
+    // so the standard input stays valid.
+    unsafe { SetStdHandle(STD_INPUT_HANDLE, handle) };
+}
+
+pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
+    std::io::stdin().read(buf)
+}
+
+pub fn parent_is_init() -> bool {
+    false
+}
+
+// W7 Task 6: detached children on Windows.
+pub fn detach(_cmd: &mut Command) {}
+
+pub fn wait_status(st: ExitStatus) -> i32 {
+    st.code().unwrap_or(-1)
+}
+
+// W7 Task 6: command output read without blocking on Windows.
+pub fn set_pipe_nonblocking(_r: &io::PipeReader, _w: &io::PipeWriter) {}
+
+// W7 Task 7: free and used space on Windows.
+pub fn fs_blocks(_path: &[u8]) -> Option<FsBlocks> {
+    None
+}
+
+/// Windows files have no execute bits to toggle.
+pub fn toggle_exec(_path: &[u8]) -> Option<u32> {
+    None
+}
+
+// W7 Task 7: dir-change polling on Windows; until then no change is reported.
+pub struct DirWatch {
+    watching: bool,
+}
+
+impl DirWatch {
+    pub fn new() -> io::Result<DirWatch> {
+        Ok(DirWatch { watching: false })
+    }
+
+    pub fn watch(&mut self, _path: &[u8]) {
+        self.watching = true;
+    }
+
+    pub fn unwatch(&mut self) {
+        self.watching = false;
+    }
+
+    pub fn is_watching(&self) -> bool {
+        self.watching
+    }
+
+    pub fn changed(&mut self) -> bool {
+        false
+    }
+}
+
+pub fn register_signals(
+    int: Arc<AtomicBool>,
+    term: Arc<AtomicBool>,
+) -> Result<(), (SignalStep, io::Error)> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::flag::register;
+    register(SIGINT, int).map_err(|e| (SignalStep::Interrupt, e))?;
+    register(SIGTERM, term).map_err(|e| (SignalStep::Terminate, e))?;
+    Ok(())
+}
+
+const INPUT_MODES: CONSOLE_MODE =
+    ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT | ENABLE_PROCESSED_INPUT;
+const OUTPUT_MODES: CONSOLE_MODE = ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+const UTF8: u32 = 65001;
+
+fn console_mode(h: HANDLE) -> Option<CONSOLE_MODE> {
+    let mut mode: CONSOLE_MODE = 0;
+    // SAFETY: GetConsoleMode only writes the mode; a handle that is not a console makes it fail.
+    (unsafe { GetConsoleMode(h, &mut mode) } != 0).then_some(mode)
+}
+
+fn std_handle(which: STD_HANDLE) -> HANDLE {
+    // SAFETY: GetStdHandle takes any STD_HANDLE value and only reads process state.
+    unsafe { GetStdHandle(which) }
+}
+
+pub fn console_modes() -> Option<(u32, u32)> {
+    Some((
+        console_mode(std_handle(STD_INPUT_HANDLE))?,
+        console_mode(std_handle(STD_OUTPUT_HANDLE))?,
+    ))
+}
+
+/// The console: input records from the standard input, VT output on the standard output (the
+/// standard error when the output is not a console).
+pub struct Term {
+    input: HANDLE,
+    output: HANDLE,
+    saved_in: CONSOLE_MODE,
+    saved_out: CONSOLE_MODE,
+    saved_cp: u32,
+    saved_out_cp: u32,
+    active: bool,
+    resize_pending: bool,
+    /// The first half of a surrogate pair typed as two key events.
+    high: Option<u16>,
+}
+
+impl Term {
+    pub fn open() -> io::Result<Term> {
+        let input = std_handle(STD_INPUT_HANDLE);
+        let saved_in = console_mode(input).ok_or_else(io::Error::last_os_error)?;
+        let (output, saved_out) = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .into_iter()
+            .map(std_handle)
+            .find_map(|h| console_mode(h).map(|m| (h, m)))
+            .ok_or_else(io::Error::last_os_error)?;
+        // SAFETY: these only read the console's code pages.
+        let (saved_cp, saved_out_cp) = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
+        let mut t = Term {
+            input,
+            output,
+            saved_in,
+            saved_out,
+            saved_cp,
+            saved_out_cp,
+            active: false,
+            resize_pending: false,
+            high: None,
+        };
+        t.apply()?;
+        Ok(t)
+    }
+
+    /// Curses' modes and UTF-8 code pages.
+    fn apply(&mut self) -> io::Result<()> {
+        // SAFETY: the handles are the console's, valid for the life of the process; the calls
+        // only change console state.
+        let ok = unsafe {
+            SetConsoleMode(self.input, INPUT_MODES) != 0
+                && SetConsoleMode(self.output, self.saved_out | OUTPUT_MODES) != 0
+                && SetConsoleCP(UTF8) != 0
+                && SetConsoleOutputCP(UTF8) != 0
+        };
+        self.active = true;
+        if ok {
+            Ok(())
+        } else {
+            let e = io::Error::last_os_error();
+            self.restore();
+            Err(e)
+        }
+    }
+
+    pub fn size(&self) -> (i32, i32) {
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        // SAFETY: info is a writable struct of the type the call fills.
+        let ws = (unsafe { GetConsoleScreenBufferInfo(self.output, &mut info) } != 0).then(|| {
+            let w = info.srWindow;
+            (
+                i32::from(w.Bottom) - i32::from(w.Top) + 1,
+                i32::from(w.Right) - i32::from(w.Left) + 1,
+            )
+        });
+        super::term_size(ws)
+    }
+
+    /// Waits up to `wait_ms` (-1: no limit) for keys; typed characters come as UTF-8 (VT input
+    /// sends keys as the escape sequences a terminal does).
+    pub fn read(&mut self, wait_ms: i32, out: &mut Vec<u8>) -> ReadResult {
+        let deadline = u64::try_from(wait_ms)
+            .ok()
+            .map(|ms| Instant::now() + Duration::from_millis(ms));
+        loop {
+            let wait = deadline.map_or(INFINITE, |d| {
+                d.saturating_duration_since(Instant::now()).as_millis() as u32
+            });
+            // SAFETY: the input handle is valid for the life of the process.
+            if unsafe { WaitForSingleObject(self.input, wait) } != WAIT_OBJECT_0 {
+                return ReadResult::Timeout;
+            }
+            let mut recs = [INPUT_RECORD::default(); 64];
+            let mut n = 0u32;
+            // SAFETY: recs has room for the 64 records asked for; n receives the count.
+            let ok = unsafe { ReadConsoleInputW(self.input, recs.as_mut_ptr(), 64, &mut n) };
+            if ok == 0 {
+                return ReadResult::Timeout;
+            }
+            let start = out.len();
+            let mut resized = false;
+            for rec in &recs[..n as usize] {
+                match u32::from(rec.EventType) {
+                    KEY_EVENT => {
+                        // SAFETY: EventType says the record holds a KEY_EVENT_RECORD.
+                        let k = unsafe { rec.Event.KeyEvent };
+                        // SAFETY: the W functions fill the UnicodeChar member.
+                        let u = unsafe { k.uChar.UnicodeChar };
+                        if k.bKeyDown != 0 && u != 0 {
+                            for _ in 0..k.wRepeatCount.max(1) {
+                                self.push_utf16(u, out);
+                            }
+                        }
+                    }
+                    WINDOW_BUFFER_SIZE_EVENT => resized = true,
+                    _ => {}
+                }
+            }
+            if resized {
+                self.resize_pending = true;
+            }
+            if out.len() > start {
+                return ReadResult::Data;
+            }
+            if resized {
+                return ReadResult::Resized;
+            }
+        }
+    }
+
+    fn push_utf16(&mut self, u: u16, out: &mut Vec<u8>) {
+        let units: Vec<u16> = match self.high.take() {
+            Some(h) if (0xDC00..0xE000).contains(&u) => vec![h, u],
+            Some(h) => {
+                push_char(char::decode_utf16([h]).next(), out);
+                vec![u]
+            }
+            None if (0xD800..0xDC00).contains(&u) => {
+                self.high = Some(u);
+                return;
+            }
+            None => vec![u],
+        };
+        for c in char::decode_utf16(units) {
+            push_char(Some(c), out);
+        }
+    }
+
+    pub fn resize_pending(&self) -> bool {
+        self.resize_pending
+    }
+
+    pub fn set_resize_pending(&mut self, on: bool) {
+        self.resize_pending = on;
+    }
+
+    /// The saved modes and code pages back.
+    pub fn restore(&mut self) {
+        if self.active {
+            // SAFETY: as in apply.
+            unsafe {
+                SetConsoleMode(self.input, self.saved_in);
+                SetConsoleMode(self.output, self.saved_out);
+                SetConsoleCP(self.saved_cp);
+                SetConsoleOutputCP(self.saved_out_cp);
+            }
+            self.active = false;
+        }
+    }
+
+    pub fn resume(&mut self) {
+        if !self.active {
+            let _ = self.apply();
+        }
+    }
+}
+
+/// A decoded UTF-16 unit as UTF-8; an unpaired surrogate as U+FFFD.
+fn push_char(c: Option<Result<char, std::char::DecodeUtf16Error>>, out: &mut Vec<u8>) {
+    if let Some(c) = c {
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+}
+
+impl Drop for Term {
+    fn drop(&mut self) {
+        self.restore();
+    }
 }
 
 #[cfg(test)]

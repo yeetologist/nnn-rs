@@ -76,3 +76,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Sto
 
 [dev-dependencies]
 trycmd = "1.2.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+portable-pty = "0.9"

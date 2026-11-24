@@ -17,8 +17,8 @@ use crate::prompt::{INVALID_POS, PROMPT};
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX};
 use std::borrow::Cow;
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::Command;
 
 /// `messages[MSG_ENTER]`
@@ -110,11 +110,11 @@ pub fn pipepath_for(tmpdir: &[u8]) -> Vec<u8> {
 }
 
 /// `read_nointr`: read(2), retried on EINTR; -1 on error.
-fn read_nointr(fd: BorrowedFd<'_>, buf: &mut [u8]) -> isize {
+fn read_nointr(fd: &mut dyn Read, buf: &mut [u8]) -> isize {
     loop {
-        match rustix::io::read(fd, &mut *buf) {
+        match fd.read(&mut *buf) {
             Ok(n) => return n as isize,
-            Err(rustix::io::Errno::INTR) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return -1,
         }
     }
@@ -129,7 +129,7 @@ struct ChildJob {
 impl ChildJob {
     /// The child of run_plugin(): holds `wfd` open while `spawn` runs the job (flag 0 or
     /// `F_MULTI` [| `F_CONFIRM`]: no curses), then closes it.
-    fn run(self, wfd: OwnedFd) {
+    fn run(self, wfd: File) {
         let mut cmd = Command::new(os(&self.argv[0]));
         cmd.args(self.argv[1..].iter().map(|a| os(a)));
         let _ = cmd.status();
@@ -219,7 +219,7 @@ impl Nnn {
     /// for 'o', `openfile`.
     pub fn readpipe(
         &mut self,
-        fd: BorrowedFd<'_>,
+        fd: &mut dyn Read,
         ctxnum: &mut i32,
         openfile: &mut Vec<u8>,
     ) -> Option<Vec<u8>> {
@@ -381,15 +381,7 @@ impl Nnn {
         }
 
         let pipe = self.g_pipepath();
-        if rustix::fs::mknodat(
-            rustix::fs::CWD,
-            os(&pipe),
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .is_err()
-        {
+        if crate::platform::mkfifo(&pipe).is_err() {
             return false;
         }
 
@@ -421,33 +413,14 @@ impl Nnn {
 
         // Both ends are opened here without blocking (the read end first, so opening the
         // write end succeeds); then they block as the original's do.
-        use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl, open};
-        let rfd = open(
-            os(&pipe),
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .ok();
-        let wfd = rfd.as_ref().and_then(|_| {
-            open(
-                os(&pipe),
-                OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .ok()
-        });
-        for fd in rfd.iter().chain(wfd.iter()) {
-            if let Ok(fl) = fcntl_getfl(fd) {
-                let _ = fcntl_setfl(fd, fl - OFlags::NONBLOCK);
-            }
-        }
+        let (mut rfd, wfd) = crate::platform::open_fifo_pair(&pipe);
 
         // In child (a thread here); when its open fails it exits at once.
         let child = wfd.map(|w| std::thread::spawn(move || job.run(w)));
 
         openfile.clear();
-        let nextpath = match &rfd {
-            Some(fd) => self.readpipe(fd.as_fd(), &mut ctx, openfile),
+        let nextpath = match &mut rfd {
+            Some(fd) => self.readpipe(fd, &mut ctx, openfile),
             None => None,
         };
         if let Some(np) = nextpath {
@@ -494,7 +467,7 @@ impl Nnn {
         let mut tmp = newpath.clone();
 
         if !self.getutil(UTIL_FZF)
-            || rustix::fs::access(os(newpath), rustix::fs::Access::EXEC_OK).is_err()
+            || crate::platform::access(newpath, crate::platform::Access::Exec).is_err()
         {
             tmp = self.xreadline(None, MESSAGES[MSG_APP_NAME]);
             r = F_NOWAIT | F_NOTRACE | F_MULTI;
@@ -657,12 +630,12 @@ mod tests {
         let mut n = Nnn::default();
         n.g_ctx[0].c_path = b"/home".to_vec();
         let mut run = |data: &[u8]| {
-            let (r, mut w) = std::io::pipe().expect("pipe");
+            let (mut r, mut w) = std::io::pipe().expect("pipe");
             w.write_all(data).expect("write");
             drop(w);
             let mut ctx = -1;
             let mut of = Vec::new();
-            let np = n.readpipe(r.as_fd(), &mut ctx, &mut of);
+            let np = n.readpipe(&mut r, &mut ctx, &mut of);
             (np, ctx, of)
         };
         assert_eq!(

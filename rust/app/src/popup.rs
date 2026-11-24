@@ -18,17 +18,14 @@ use crate::curses::{
 };
 use crate::fmt;
 use crate::keys::Action;
+use crate::platform::{self, Errno};
 use crate::state::{Kv, Nnn, PATH_MAX};
 use crate::sys;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::Ordering;
 
 // Flags of spawn() (nnn.c 267-279).
 pub const F_NONE: u16 = 0x00;
@@ -241,19 +238,19 @@ pub fn xgetenv(name: &str, fallback: Option<&[u8]>) -> Option<Vec<u8>> {
 /// `get_fs_info`: available, used or total bytes of the file system holding `path`
 /// (shifted by `ffs(f_frsize >> 1)` as the original does); 0 when statvfs fails.
 pub fn get_fs_info(path: &[u8], ty: u8) -> u64 {
-    let Ok(svb) = rustix::fs::statvfs(os(path)) else {
+    let Some(svb) = platform::fs_blocks(path) else {
         return 0;
     };
-    let half = (svb.f_frsize >> 1) as i32;
+    let half = (svb.frsize >> 1) as i32;
     let shift = if half == 0 {
         0
     } else {
         half.trailing_zeros() + 1
     };
     let blocks = match ty {
-        VFS_AVAIL => svb.f_bavail,
-        VFS_USED => svb.f_blocks.wrapping_sub(svb.f_bfree),
-        _ => svb.f_blocks,
+        VFS_AVAIL => svb.bavail,
+        VFS_USED => svb.blocks.wrapping_sub(svb.bfree),
+        _ => svb.blocks,
     };
     blocks.wrapping_shl(shift)
 }
@@ -595,10 +592,10 @@ fn mkstemp(template: &[u8]) -> io::Result<(File, Vec<u8>)> {
     use std::hash::{BuildHasher, Hasher};
     const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let Some(start) = template.len().checked_sub(6) else {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        return Err(platform::error(Errno::Inval));
     };
     if &template[start..] != b"XXXXXX" {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        return Err(platform::error(Errno::Inval));
     }
     let mut name = template.to_vec();
     let seed = std::collections::hash_map::RandomState::new();
@@ -612,34 +609,54 @@ fn mkstemp(template: &[u8]) -> io::Result<(File, Vec<u8>)> {
             *c = LETTERS[(v % 62) as usize];
             v /= 62;
         }
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(os(&name))
+        match platform::private_mode(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true),
+        )
+        .open(os(&name))
         {
             Ok(f) => return Ok((f, name)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
-    Err(io::Error::from_raw_os_error(libc::EEXIST))
+    Err(platform::error(Errno::Exist))
 }
 
 /// `spawn_redirected`: runs `argv` (looked up in PATH) with stdout and stderr on `out`.
 /// `close_stdin`: the input fd passed is STDIN_FILENO, which the original closes in the
 /// child; here the child's stdin is /dev/null. A pipe's own read end is close-on-exec.
-fn spawn_redirected(argv: &[Vec<u8>], close_stdin: bool, out: &impl AsFd) -> io::Result<Child> {
+fn spawn_redirected(
+    argv: &[Vec<u8>],
+    close_stdin: bool,
+    out: &impl ChildOutput,
+) -> io::Result<Child> {
     let mut c = Command::new(os(&argv[0]));
     c.args(argv[1..].iter().map(|a| os(a)));
     if close_stdin {
         c.stdin(Stdio::null());
     }
-    let o: OwnedFd = out.as_fd().try_clone_to_owned()?;
-    let e: OwnedFd = out.as_fd().try_clone_to_owned()?;
-    c.stdout(Stdio::from(o)).stderr(Stdio::from(e));
+    c.stdout(out.child_stdio()?).stderr(out.child_stdio()?);
     c.spawn()
+}
+
+/// Where `spawn_redirected` sends a child's output: each stream gets its own duplicate.
+trait ChildOutput {
+    fn child_stdio(&self) -> io::Result<Stdio>;
+}
+
+impl ChildOutput for File {
+    fn child_stdio(&self) -> io::Result<Stdio> {
+        Ok(self.try_clone()?.into())
+    }
+}
+
+impl ChildOutput for io::PipeWriter {
+    fn child_stdio(&self) -> io::Result<Stdio> {
+        Ok(self.try_clone()?.into())
+    }
 }
 
 /// `waitpid(pid, NULL, 0)`
@@ -660,11 +677,11 @@ impl Nnn {
     /// is not reported afterwards.
     fn xfork(&mut self, mut cmd: Command, flag: u16) -> Forked {
         if let Some(cs) = self.curses.as_mut() {
-            self.popup.winch = Some(cs.resized.load(Ordering::Relaxed));
+            self.popup.winch = Some(cs.resize_pending());
         }
         if flag & F_NOWAIT != 0 {
             // The grandchild is detached in its own process group (setsid() in the original).
-            cmd.process_group(0);
+            platform::detach(&mut cmd);
             if let Ok(mut child) = cmd.spawn() {
                 std::thread::spawn(move || child.wait());
             }
@@ -684,7 +701,7 @@ impl Nnn {
             match p {
                 Forked::Child(mut child) => {
                     if let Ok(st) = child.wait() {
-                        status = st.code().unwrap_or_else(|| st.into_raw());
+                        status = platform::wait_status(st);
                     }
                 }
                 Forked::ExecFailed => status = 0,
@@ -693,7 +710,7 @@ impl Nnn {
         }
         // restore parent's signal handling
         if let (Some(was), Some(cs)) = (self.popup.winch.take(), self.curses.as_mut()) {
-            cs.resized.store(was, Ordering::Relaxed);
+            cs.set_resize_pending(was);
         }
         status
     }
@@ -754,11 +771,8 @@ impl Nnn {
             let mut out = io::stdout();
             let _ = out.write_all(MSG_ENTER);
             let _ = out.flush();
-            let stdin = io::stdin();
             let mut c = [0u8; 1];
-            while matches!(rustix::io::read(stdin.as_fd(), &mut c), Ok(n) if n > 0) && c[0] != b'\n'
-            {
-            }
+            while matches!(platform::read_stdin(&mut c), Ok(n) if n > 0) && c[0] != b'\n' {}
         }
 
         if flag & F_NORMAL != 0
@@ -821,11 +835,7 @@ impl Nnn {
                 Ok(p) => p,
                 Err(e) => self.popup_errexit(5493, &e),
             };
-            for fd in [r.as_fd(), w.as_fd()] {
-                if let Ok(fl) = rustix::fs::fcntl_getfl(fd) {
-                    let _ = rustix::fs::fcntl_setfl(fd, fl | rustix::fs::OFlags::NONBLOCK);
-                }
-            }
+            platform::set_pipe_nonblocking(&r, &w);
             pipe = Some((r, w));
         }
 
@@ -1022,33 +1032,14 @@ impl Nnn {
     /// `xchmod`: toggles the execute bits (all three, after the owner's) of the hovered entry
     /// (not following a symlink); `pathbuf` gets its path.
     pub fn xchmod(&mut self, pathbuf: &mut Vec<u8>, dir: &[u8]) -> bool {
-        use rustix::fs::{Mode, OFlags};
         *pathbuf = mkpath(&self.home, dir, &self.pdents[self.cur as usize].name);
-
-        let Ok(fd) = rustix::fs::open(
-            os(pathbuf),
-            OFlags::RDONLY | OFlags::NOFOLLOW,
-            Mode::empty(),
-        ) else {
-            return false;
-        };
-        let Ok(sb) = rustix::fs::fstat(&fd) else {
-            return false;
-        };
-
-        let mut mode = sb.st_mode;
-        // (Un)set (S_IXUSR | S_IXGRP | S_IXOTH)
-        if mode & 0o100 != 0 {
-            mode &= !0o111;
-        } else {
-            mode |= 0o111;
+        match platform::toggle_exec(pathbuf) {
+            Some(mode) => {
+                self.pdents[self.cur as usize].mode = mode;
+                true
+            }
+            None => false,
         }
-
-        if rustix::fs::fchmod(&fd, Mode::from_bits_retain(mode & 0o7777)).is_ok() {
-            self.pdents[self.cur as usize].mode = mode;
-            return true;
-        }
-        false
     }
 
     /// `lock_terminal`: runs `$NNN_LOCKER` (default vlock).

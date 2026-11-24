@@ -7,7 +7,7 @@
 //! `invertselbuf` take, and `findinsel`/`rmfromselbuf` take the bytes to look for.
 
 use crate::config::{cstr, is_prefix, xstrsncpy};
-use crate::platform::path;
+use crate::platform::{self, path};
 use crate::popup::{F_CLI, F_CONFIRM};
 use crate::sort::{FILE_SCANNED, FILE_SELECTED};
 use crate::state::{NAME_MAX, Nnn, PATH_MAX};
@@ -15,7 +15,6 @@ use crate::sys;
 use std::cmp::Ordering;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 
 const MSG_0_SELECTED: &[u8] = b"0 selected";
 const MSG_CUR_SEL_OPTS: &[u8] = b"'c'urrent/'s'el?";
@@ -103,15 +102,11 @@ impl Nnn {
         let Some(selpath) = self.selpath.clone() else {
             return;
         };
-        let f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        let f = platform::private_mode(OpenOptions::new().write(true).create(true).truncate(true))
             .open(path(&selpath));
         let err = match f {
             Ok(mut f) => match self.pselbuf.get(..buflen) {
-                None => Some(io::Error::from_raw_os_error(libc::EFAULT)),
+                None => Some(platform::error(platform::Errno::Fault)),
                 Some(buf) => match f.write(buf) {
                     Ok(n) if n == buflen => None,
                     Ok(_) => Some(io::Error::last_os_error()),
@@ -520,14 +515,10 @@ impl Nnn {
         };
 
         // Fail if selection file path isn't accessible
-        if let Err(e) = rustix::fs::access(
-            &*path(&selpath),
-            rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
-        ) {
-            if e == rustix::io::Errno::NOENT {
+        if let Err(e) = platform::access(&selpath, platform::Access::ReadWrite) {
+            if platform::is_errno(&e, platform::Errno::NoEnt) {
                 self.printmsg(MSG_0_SELECTED);
             } else {
-                let e = io::Error::from_raw_os_error(e.raw_os_error());
                 self.printwait(sys::strerror(&e).as_bytes(), None);
             }
             return false;

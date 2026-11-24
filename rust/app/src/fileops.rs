@@ -8,12 +8,11 @@
 use crate::browse::{MESSAGES, MSG_FAILED};
 use crate::config::{CMD_LEN_MAX, cstr};
 use crate::keys::Action;
-use crate::platform::path;
+use crate::platform::{self, path};
 use crate::popup::{F_CHKRTN, F_CLI};
 use crate::state::{NAME_MAX, Nnn, PATH_MAX};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
 
 // messages[] indexes this module uses.
 const MSG_0_SELECTED: usize = 3;
@@ -222,8 +221,8 @@ impl Nnn {
         drop(f);
 
         // Save the last modification time
-        let mtime = match std::fs::metadata(path(&tmp)) {
-            Ok(sb) => sb.mtime(),
+        let mtime = match platform::stat(&tmp, true) {
+            Ok(sb) => sb.mtime.0,
             Err(_) => {
                 self.rmtmpfile(&tmp);
                 return -1;
@@ -240,9 +239,8 @@ impl Nnn {
                 return -1;
             }
         };
-        let (st_mtime, st_size) = f
-            .metadata()
-            .map_or((0, 0), |sb| (sb.mtime(), sb.size() as usize));
+        let (st_mtime, st_size) =
+            platform::stat(&tmp, true).map_or((0, 0), |sb| (sb.mtime.0, sb.size as usize));
 
         'emptyedit: {
             if mtime == st_mtime {

@@ -2,14 +2,13 @@
 //! sel_paths_in_dir, archive_selection, handle_archive, archive_mount, remote_mount, unmount).
 
 use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::browse::{MESSAGES, MSG_FAILED, xdiraccess};
 use crate::config::{
     TOK_MNT, TOKS, cstr, is_prefix, is_suffix, mkpath, xbasename, xdirname, xmktree_io,
 };
-use crate::platform::path;
+use crate::platform::{self, path};
 use crate::popup::{F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, xgetenv};
 use crate::prompt::{MSGWAIT, XDELAY_INTERVAL_MS, xconfirm};
 use crate::state::{Nnn, PATH_MAX};
@@ -397,8 +396,8 @@ impl Nnn {
         };
 
         let mut tmp: Option<Vec<u8>> = name.map(|n| cstr(n).to_vec());
-        let mut sb: Option<std::fs::Metadata> = None;
-        let mut psb: Option<std::fs::Metadata> = None;
+        let mut sb: Option<platform::FileInfo> = None;
+        let mut psb: Option<platform::FileInfo> = None;
         let mut hovered = false;
 
         let mntpath = self.mntpath();
@@ -407,8 +406,8 @@ impl Nnn {
             && mntpath == cstr(currentpath)
         {
             *newpath = mkpath(&mntpath, t, &self.home).0;
-            sb = std::fs::symlink_metadata(path(newpath)).ok();
-            psb = std::fs::symlink_metadata(path(&xdirname(newpath))).ok();
+            sb = platform::stat(newpath, false).ok();
+            psb = platform::stat(&xdirname(newpath), false).ok();
             if sb.is_none() && psb.is_none() {
                 *presel = MSGWAIT;
                 return false;
@@ -418,7 +417,8 @@ impl Nnn {
         let needs_host = match (&tmp, &sb) {
             (None, _) | (_, None) => true,
             (Some(_), Some(s)) => {
-                !s.file_type().is_dir() || psb.as_ref().is_some_and(|p| s.dev() == p.dev())
+                s.mode & platform::S_IFMT != platform::S_IFDIR
+                    || psb.as_ref().is_some_and(|p| s.dev == p.dev)
             }
         };
         if needs_host {

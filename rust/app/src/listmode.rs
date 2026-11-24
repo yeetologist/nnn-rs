@@ -4,13 +4,12 @@
 
 use crate::curses::color_pair;
 use crate::dir::selforparent;
-use crate::platform::{self, Os, path};
+use crate::platform::{self, Os};
+use crate::platform::{Access, Errno};
 use crate::state::{Nnn, PATH_MAX};
 use crate::sys;
-use rustix::fd::{AsFd, BorrowedFd};
-use rustix::fs::{Access, Mode, OFlags};
 use std::hash::{BuildHasher, Hasher};
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::time::Duration;
 
 /// \`LIST_FILES_MAX\`: list mode shows at most 16K files.
@@ -97,9 +96,9 @@ fn common_prefix_with(os: Os, path: &[u8], prefix: &mut Vec<u8>) -> bool {
 
 /// \`xmktree(path, TRUE, TRUE)\`: \`mkdir -p\` with mode 0777 (umask applies).
 fn xmktree(p: &[u8]) -> bool {
-    let mkdir = |d: &[u8]| match rustix::fs::mkdir(&*path(d), Mode::from_raw_mode(0o777)) {
-        Ok(()) | Err(rustix::io::Errno::EXIST) => true,
-        Err(_) => false,
+    let mkdir = |d: &[u8]| match platform::mkdir(d, 0o777) {
+        Ok(()) => true,
+        Err(e) => platform::is_errno(&e, Errno::Exist),
     };
     if p.is_empty() {
         return false;
@@ -133,9 +132,9 @@ fn mkdtemp(template: &mut [u8]) -> bool {
             *c = LETTERS[(v % 62) as usize];
             v /= 62;
         }
-        match rustix::fs::mkdir(&*path(template), Mode::from_raw_mode(0o700)) {
+        match platform::mkdir(template, 0o700) {
             Ok(()) => return true,
-            Err(rustix::io::Errno::EXIST) => {}
+            Err(e) if platform::is_errno(&e, Errno::Exist) => {}
             Err(_) => return false,
         }
     }
@@ -208,7 +207,7 @@ impl Nnn {
             // Get the dir containing the path
             let dir_end = xmemrchr(&tmpdir[tmp..], b'/').map_or(tmpdir.len(), |s| tmp + s);
             let dir = &tmpdir[..dir_end];
-            if rustix::fs::access(&*path(dir), Access::EXISTS).is_err() {
+            if platform::access(dir, Access::Exists).is_err() {
                 // Create directory if it doesn't exist
                 xmktree(dir);
             }
@@ -226,7 +225,7 @@ impl Nnn {
     /// \`cwd\`, or the working directory when \`None\`), sets \`listroot\` to their common directory
     /// and builds the temp tree. Shows "0 entries" / "file limit exceeded" on the status line
     /// once curses runs, on stderr before.
-    pub fn load_input(&mut self, fd: BorrowedFd<'_>, cwd: Option<&[u8]>) -> Option<Vec<u8>> {
+    pub fn load_input(&mut self, fd: &mut dyn Read, cwd: Option<&[u8]>) -> Option<Vec<u8>> {
         let chunk = CHUNK;
         let mut chunk_count = 1usize;
         let mut input = vec![0u8; chunk];
@@ -245,13 +244,12 @@ impl Nnn {
 
         'read: {
             while chunk_count < LIST_INPUT_MAX / chunk && msgnum.is_none() {
-                let input_read =
-                    match rustix::io::read(fd, &mut input[total_read..total_read + chunk]) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(rustix::io::Errno::INTR) => continue,
-                        Err(_) => break 'read,
-                    };
+                let input_read = match fd.read(&mut input[total_read..total_read + chunk]) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break 'read,
+                };
                 total_read += input_read;
 
                 while off < total_read {
@@ -355,29 +353,18 @@ impl Nnn {
     /// \`main()\` returns \`EXIT_FAILURE\`. The caller also clears \`curssn\` (sessions) when this
     /// read a list.
     pub fn list_mode_main(&mut self) -> bool {
-        let stdin = rustix::stdio::stdin();
-        if rustix::termios::isatty(stdin) {
+        let mut stdin = std::io::stdin();
+        if stdin.is_terminal() {
             return true;
         }
         // This is the same as listpath
-        let Some(initpath) = self.load_input(stdin, None) else {
+        let Some(initpath) = self.load_input(&mut stdin, None) else {
             return false;
         };
         self.initpath = initpath;
 
         // We return to tty
-        let stdout = rustix::stdio::stdout();
-        if !rustix::termios::isatty(stdout) {
-            if let Ok(fd) = rustix::fs::open(
-                &*platform::os(platform::tty_device()),
-                OFlags::RDONLY,
-                Mode::from_raw_mode(0o400),
-            ) {
-                let _ = rustix::stdio::dup2_stdin(fd.as_fd());
-            }
-        } else {
-            let _ = rustix::stdio::dup2_stdin(stdout);
-        }
+        platform::stdin_to_tty();
         true
     }
 }
@@ -386,6 +373,7 @@ impl Nnn {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn dirname_and_prefix() {
         assert_eq!(xdirname(b"/a/b"), b"/a");
@@ -421,6 +409,8 @@ mod tests {
         assert_eq!(p, b"//srv/share/");
     }
 
+    // W7 Task 6: list mode's temp tree needs symlinks and rm -rf (Unix only so far).
+    #[cfg(unix)]
     #[test]
     fn tmp_tree_from_pipe() {
         let base = std::env::temp_dir().join(format!("nnn-listmode-{}", std::process::id()));
@@ -433,11 +423,11 @@ mod tests {
             g_tmpfpath: crate::platform::bytes(base.as_os_str()).to_vec(),
             ..Nnn::default()
         };
-        let (r, mut w) = std::io::pipe().unwrap();
+        let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"d/e/f\0\0./d/g\0.\0missing/x\0\nnl\0d/e")
             .unwrap();
         drop(w);
-        let root = n.load_input(r.as_fd(), Some(&fxb)).unwrap();
+        let root = n.load_input(&mut r, Some(&fxb)).unwrap();
         assert_eq!(n.listpath.as_deref(), Some(root.as_slice()));
         // "missing/x" still counts towards the common directory.
         assert_eq!(n.listroot.as_deref(), Some(fxb.as_slice()));
@@ -458,10 +448,10 @@ mod tests {
         assert!(n.listpath.is_none());
 
         // Only separators: 0 entries, nothing created.
-        let (r, mut w) = std::io::pipe().unwrap();
+        let (mut r, mut w) = std::io::pipe().unwrap();
         w.write_all(b"\0\0\0").unwrap();
         drop(w);
-        assert_eq!(n.load_input(r.as_fd(), Some(&fxb)), None);
+        assert_eq!(n.load_input(&mut r, Some(&fxb)), None);
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

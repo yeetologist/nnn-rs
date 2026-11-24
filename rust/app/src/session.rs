@@ -10,7 +10,6 @@ use crate::prompt::XDELAY_INTERVAL_MS;
 use crate::sort::TimeType;
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX, REGEX_MAX, Settings};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 
 /// \`SESSIONS_VERSION\`
 pub const SESSIONS_VERSION: u64 = 1;
@@ -187,12 +186,13 @@ impl Nnn {
         }
         let bytes = self.session_bytes();
         let spath = self.ssn_path(sname);
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&*crate::platform::os(&spath));
+        let f = crate::platform::private_mode(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&*crate::platform::os(&spath));
         let Ok(mut f) = f else {
             self.printwait(MESSAGES[MSG_SEL_MISSING], presel);
             return;
