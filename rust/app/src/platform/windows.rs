@@ -503,6 +503,10 @@ pub struct Term {
     saved_out_cp: u32,
     active: bool,
     resize_pending: bool,
+    /// The visible window's size when last looked at: a buffer-size event only counts as a
+    /// resize when this changed (conhost also sends them for alternate-screen switches and
+    /// screen clears, which would otherwise make every redraw report a resize).
+    window: Option<(i32, i32)>,
     /// The first half of a surrogate pair typed as two key events.
     high: Option<u16>,
 }
@@ -527,8 +531,10 @@ impl Term {
             saved_out_cp,
             active: false,
             resize_pending: false,
+            window: None,
             high: None,
         };
+        t.window = t.window_size();
         t.apply()?;
         Ok(t)
     }
@@ -553,17 +559,21 @@ impl Term {
         }
     }
 
-    pub fn size(&self) -> (i32, i32) {
+    /// The visible window (`srWindow`, not the buffer): (lines, columns).
+    fn window_size(&self) -> Option<(i32, i32)> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         // SAFETY: info is a writable struct of the type the call fills.
-        let ws = (unsafe { GetConsoleScreenBufferInfo(self.output, &mut info) } != 0).then(|| {
+        (unsafe { GetConsoleScreenBufferInfo(self.output, &mut info) } != 0).then(|| {
             let w = info.srWindow;
             (
                 i32::from(w.Bottom) - i32::from(w.Top) + 1,
                 i32::from(w.Right) - i32::from(w.Left) + 1,
             )
-        });
-        super::term_size(ws)
+        })
+    }
+
+    pub fn size(&self) -> (i32, i32) {
+        super::term_size(self.window_size())
     }
 
     /// Waits up to `wait_ms` (-1: no limit) for keys; typed characters come as UTF-8 (VT input
@@ -602,7 +612,13 @@ impl Term {
                             }
                         }
                     }
-                    WINDOW_BUFFER_SIZE_EVENT => resized = true,
+                    WINDOW_BUFFER_SIZE_EVENT => {
+                        let now = self.window_size();
+                        if now != self.window {
+                            self.window = now;
+                            resized = true;
+                        }
+                    }
                     _ => {}
                 }
             }
