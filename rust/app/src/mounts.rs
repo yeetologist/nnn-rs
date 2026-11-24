@@ -135,13 +135,37 @@ fn tar_cmd_prefix(cmd: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(argv)
 }
 
+/// Reads the NUL-separated selection entries from `pselbuf`, falling back to `selpath`
+/// when `pselbuf` is empty (external selection).
+fn selection_entries(pselbuf: &[u8], selpath: &[u8], relative: bool, path: &[u8]) -> Vec<Vec<u8>> {
+    let owned;
+    let buf = if pselbuf.is_empty() && !selpath.is_empty() {
+        owned = std::fs::read(crate::platform::path(selpath)).unwrap_or_default();
+        owned.as_slice()
+    } else {
+        pselbuf
+    };
+    let path_bytes = cstr(path);
+    let dirlen = path_bytes.len() + usize::from(path_bytes != b"/");
+    buf.split(|&c| c == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            if relative {
+                e.get(dirlen..).unwrap_or_default().to_vec()
+            } else {
+                e.to_vec()
+            }
+        })
+        .collect()
+}
+
 /// Windows tar-family argv for a selection: passes entries directly as UTF-16 argv when they
 /// fit under `CreateProcessW`'s limit (so bsdtar receives Unicode names without `-T`'s
 /// ANSI codepage decoding), and falls back to `--null -T <list>` for oversized selections.
 fn tar_selection_argv(
     cmd: &[u8],
     archive: &[u8],
-    entries: &[&[u8]],
+    entries: &[Vec<u8>],
     list: &[u8],
 ) -> Option<Vec<Vec<u8>>> {
     let mut argv = tar_cmd_prefix(cmd)?;
@@ -150,7 +174,7 @@ fn tar_selection_argv(
     if !entries.is_empty() && approx_len <= 28_000 {
         argv.push(cstr(archive).to_vec());
         argv.push(b"--".to_vec());
-        argv.extend(entries.iter().map(|e| e.to_vec()));
+        argv.extend(entries.iter().cloned());
         return Some(argv);
     }
     tar_list_argv(cmd, archive, list)
@@ -233,20 +257,7 @@ impl Nnn {
         };
 
         let win_tar_argv = if cfg!(windows) {
-            let path_bytes = cstr(path);
-            let dirlen = path_bytes.len() + usize::from(path_bytes != b"/");
-            let entries: Vec<&[u8]> = self
-                .pselbuf
-                .split(|&c| c == 0)
-                .filter(|e| !e.is_empty())
-                .map(|e| {
-                    if relative {
-                        e.get(dirlen..).unwrap_or_default()
-                    } else {
-                        e
-                    }
-                })
-                .collect();
+            let entries = selection_entries(&self.pselbuf, &selpath, relative, path);
             tar_selection_argv(cmd, archive, &entries, &selpath)
         } else {
             None
@@ -653,6 +664,25 @@ mod tests {
         assert_eq!(tar_list_argv(b"atool -a", b"a.tar", b"l"), None);
     }
 
+    #[test]
+    fn selection_entries_falls_back_to_selpath() {
+        let dir = std::env::temp_dir().join(format!("nnn-selpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sel = dir.join(".selection");
+        std::fs::write(&sel, b"/w/a\0/w/b c\0").unwrap();
+        let sel_b = crate::platform::bytes(sel.as_os_str()).into_owned();
+        assert_eq!(
+            selection_entries(b"", &sel_b, true, b"/w"),
+            vec![b"a".to_vec(), b"b c".to_vec()]
+        );
+        assert_eq!(
+            selection_entries(b"", &sel_b, false, b"/w"),
+            vec![b"/w/a".to_vec(), b"/w/b c".to_vec()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(windows)]
     #[test]
     fn tar_list_argv_archives_odd_names() {
@@ -664,7 +694,7 @@ mod tests {
             std::fs::write(dir.join(n), b"data").unwrap();
         }
         let list_path = dir.join("list");
-        let entries: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+        let entries: Vec<Vec<u8>> = names.iter().map(|n| n.as_bytes().to_vec()).collect();
         let list_arg = crate::platform::bytes(list_path.as_os_str()).into_owned();
         let cmd = windows_tar_cmd(std::env::var_os("SystemRoot").as_deref());
         let argv = tar_selection_argv(&cmd, b"g.tar", &entries, &list_arg).unwrap();

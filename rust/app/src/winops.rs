@@ -60,10 +60,20 @@ fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     v
 }
 
+/// The parent directory of `p` (`"."` for a bare name with no `/`).
+fn parent_dir(p: &[u8]) -> &[u8] {
+    let p = p.strip_suffix(b"/").unwrap_or(p);
+    if !p.contains(&b'/') {
+        return b".";
+    }
+    let d = platform::xdirname(p);
+    if d.is_empty() { b"/" } else { d }
+}
+
 /// `EINVAL` when `dest_dir/<name of src>` is `src` itself, or (for a real directory) inside
 /// it. A link at `src` is not followed: the link itself is what is copied or moved.
 fn check_target(src: &[u8], dest_dir: &[u8]) -> io::Result<()> {
-    let parent = fs::canonicalize(path(platform::xdirname(src)))?;
+    let parent = fs::canonicalize(path(parent_dir(src)))?;
     let d = fs::canonicalize(path(dest_dir))?;
     if parent == d {
         return Err(platform::error(Errno::Inval));
@@ -91,9 +101,9 @@ pub fn copy_into(
 /// existing file and keeping modification times. Refuses copying onto itself or (for a
 /// real directory) inside itself (`EINVAL`).
 pub fn copy_to(src: &[u8], dst: &[u8]) -> io::Result<()> {
-    let src_parent = fs::canonicalize(path(platform::xdirname(src)))?;
+    let src_parent = fs::canonicalize(path(parent_dir(src)))?;
     let src_full = src_parent.join(&*platform::os(base(src)));
-    let dst_parent = fs::canonicalize(path(platform::xdirname(dst)))?;
+    let dst_parent = fs::canonicalize(path(parent_dir(dst)))?;
     let dst_full =
         fs::canonicalize(path(dst)).unwrap_or_else(|_| dst_parent.join(&*platform::os(base(dst))));
     let real_dir = fs::symlink_metadata(path(src))?.is_dir();
@@ -1025,5 +1035,14 @@ mod tests {
         let e = copy_to(&b(&d), &b(&d.join("sub"))).unwrap_err();
         assert!(platform::is_errno(&e, Errno::Inval), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_dir_handles_bare_and_rooted_names() {
+        assert_eq!(parent_dir(b"dir1"), b".");
+        assert_eq!(parent_dir(b"dir1/"), b".");
+        assert_eq!(parent_dir(b"a/b"), b"a");
+        assert_eq!(parent_dir(b"a/b/"), b"a");
+        assert_eq!(parent_dir(b"/a"), b"/");
     }
 }
