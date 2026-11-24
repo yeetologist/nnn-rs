@@ -30,6 +30,87 @@ const MV: &[u8] = b"mv -i --";
 const PROGRESS_CP: &[u8] = b"cpg -giRp --";
 const PROGRESS_MV: &[u8] = b"mvg -gi --";
 
+/// Command lines for the selection on Windows with Coreutils (compiled everywhere so the
+/// tests run on Linux too).
+#[cfg_attr(
+    all(not(windows), not(test)),
+    expect(
+        dead_code,
+        reason = "used on Windows only; compiled everywhere so its tests run on Linux"
+    )
+)]
+pub(crate) mod cmdline {
+    use crate::keys::Action;
+
+    /// The longest command line a Windows program is started with, in bytes counted as
+    /// `chunk_argv` does (the OS limit is 32,767 UTF-16 units; UTF-8 bytes never count fewer).
+    pub(crate) const WIN_CMDLINE_MAX: usize = 32_000;
+
+    /// `head ++ items ++ tail` cut into command lines of at most `limit` (each argument costs
+    /// its length plus 3: quotes and a blank), items in order; an item too long on its own gets
+    /// a command line of its own. No items, no command lines.
+    pub(crate) fn chunk_argv(
+        head: &[Vec<u8>],
+        items: &[Vec<u8>],
+        tail: &[Vec<u8>],
+        limit: usize,
+    ) -> Vec<Vec<Vec<u8>>> {
+        let cost = |a: &Vec<u8>| a.len() + 3;
+        let base: usize = head.iter().chain(tail).map(cost).sum();
+        let finish = |cur: &[Vec<u8>]| [head, cur, tail].concat();
+        let mut chunks = Vec::new();
+        let mut cur: Vec<Vec<u8>> = Vec::new();
+        let mut used = base;
+        for it in items {
+            if !cur.is_empty() && used + cost(it) > limit {
+                chunks.push(finish(&cur));
+                cur.clear();
+                used = base;
+            }
+            used += cost(it);
+            cur.push(it.clone());
+        }
+        if !cur.is_empty() {
+            chunks.push(finish(&cur));
+        }
+        chunks
+    }
+
+    /// The command before and after the selected paths for `sel`: `cp -iRp -- … .`,
+    /// `mv -i -- … .`, or the original's `rm -%cvr -- …` with `force` ('f' or 'i').
+    pub(crate) fn selection_argv(sel: Action, force: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let w = |s: &[&[u8]]| s.iter().map(|a| a.to_vec()).collect::<Vec<_>>();
+        match sel {
+            Action::Cp => (w(&[b"cp", b"-iRp", b"--"]), w(&[b"."])),
+            Action::Mv => (w(&[b"mv", b"-i", b"--"]), w(&[b"."])),
+            _ => (w(&[b"rm", &[b'-', force, b'v', b'r'], b"--"]), Vec::new()),
+        }
+    }
+
+    /// Where a selection copy, move or remove runs on Windows.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Route {
+        /// Coreutils' `cp`, `mv` or `rm`, as on Linux.
+        Coreutils,
+        /// `winops` (no Coreutils, or it lacks the tool).
+        Native,
+    }
+
+    /// `Coreutils` when `has` reports the tool `sel` needs (`cp`, `mv`, else `rm`).
+    pub(crate) fn cpmvrm_route(sel: Action, has: fn(&[u8]) -> bool) -> Route {
+        let tool: &[u8] = match sel {
+            Action::Cp => b"cp",
+            Action::Mv => b"mv",
+            _ => b"rm",
+        };
+        if has(tool) {
+            Route::Coreutils
+        } else {
+            Route::Native
+        }
+    }
+}
+
 /// `snprintf(buf, CMD_LEN_MAX, ...)`: the text cut to what fits with its NUL.
 fn cmdbuf(mut v: Vec<u8>) -> Vec<u8> {
     v.truncate(CMD_LEN_MAX - 1);
@@ -441,7 +522,10 @@ impl Nnn {
         // Windows has no cp, mv or rm: they run here (a trash command still runs as set).
         #[cfg(windows)]
         if sel != Action::Cpmvas && !(sel == Action::Trash && self.trashcmd.is_some()) {
-            return self.cpmvrm_native(sel, dirpath);
+            return match cmdline::cpmvrm_route(sel, platform::has_coreutil) {
+                cmdline::Route::Coreutils => self.cpmvrm_coreutils(sel, dirpath),
+                cmdline::Route::Native => self.cpmvrm_native(sel, dirpath),
+            };
         }
 
         let g_buf = match sel {
@@ -483,6 +567,43 @@ impl Nnn {
         }
 
         // Clear selection
+        self.clearselection();
+        true
+    }
+
+    /// `cpmvrm_selection` on Windows with Coreutils: its `cp`, `mv` or `rm` run as on Linux
+    /// (their own prompts on the console, in `dirpath`), the selection's paths as arguments,
+    /// as many runs as the command-line limit needs. A failed run keeps the selection.
+    #[cfg(windows)]
+    fn cpmvrm_coreutils(&mut self, sel: Action, dirpath: &[u8]) -> bool {
+        let force = if sel == Action::Cp || sel == Action::Mv {
+            0
+        } else {
+            match self.confirm_force(true, false) {
+                0 => {
+                    self.printmsg(MESSAGES[MSG_CANCEL]);
+                    return false;
+                }
+                r => r,
+            }
+        };
+        use cmdline::{WIN_CMDLINE_MAX, chunk_argv, selection_argv};
+        let (head, tail) = selection_argv(sel, force);
+        let list =
+            std::fs::read(path(self.selpath.as_deref().unwrap_or_default())).unwrap_or_default();
+        let items: Vec<Vec<u8>> = list
+            .split(|&c| c == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        let mut failed = false;
+        for argv in chunk_argv(&head, &items, &tail, WIN_CMDLINE_MAX) {
+            failed |= self.spawn_argv(&argv, 1, Some(dirpath), F_CLI | F_CHKRTN) != 0;
+        }
+        if failed {
+            self.printmsg(MESSAGES[MSG_FAILED]);
+            return false;
+        }
         self.clearselection();
         true
     }
@@ -617,7 +738,194 @@ impl Nnn {
 
 #[cfg(test)]
 mod tests {
+    use super::cmdline::*;
     use super::*;
+
+    fn v(s: &[&str]) -> Vec<Vec<u8>> {
+        s.iter().map(|x| x.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn chunk_argv_fits_one() {
+        let (head, tail, items) = (v(&["cp", "--"]), v(&["."]), v(&["a", "b", "c"]));
+        assert_eq!(
+            chunk_argv(&head, &items, &tail, WIN_CMDLINE_MAX),
+            vec![v(&["cp", "--", "a", "b", "c", "."])]
+        );
+    }
+
+    #[test]
+    fn chunk_argv_splits() {
+        let (head, tail) = (v(&["rm", "-fvr", "--"]), Vec::new());
+        let items: Vec<Vec<u8>> = (0..2000).map(|i| format!("{i:040}").into_bytes()).collect();
+        let chunks = chunk_argv(&head, &items, &tail, WIN_CMDLINE_MAX);
+        assert!(chunks.len() >= 2);
+        let mut seen = Vec::new();
+        for c in &chunks {
+            assert!(c.iter().map(|a| a.len() + 3).sum::<usize>() <= WIN_CMDLINE_MAX);
+            assert_eq!(&c[..head.len()], &head[..]);
+            seen.extend_from_slice(&c[head.len()..]);
+        }
+        assert_eq!(seen, items);
+    }
+
+    #[test]
+    fn chunk_argv_oversize_item_alone() {
+        let (head, tail) = (v(&["cp", "--"]), v(&["."]));
+        let big = vec![b'x'; 101];
+        let items = vec![b"a".to_vec(), big.clone(), b"b".to_vec()];
+        let chunks = chunk_argv(&head, &items, &tail, 100);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[1], [&head[..], &[big][..], &tail[..]].concat());
+        assert!(chunks.iter().all(|c| c.last() == Some(&b".".to_vec())));
+    }
+
+    #[test]
+    fn chunk_argv_empty() {
+        assert!(chunk_argv(&v(&["cp"]), &[], &v(&["."]), WIN_CMDLINE_MAX).is_empty());
+    }
+
+    #[test]
+    fn selection_argv_forms() {
+        assert_eq!(
+            selection_argv(Action::Cp, 0),
+            (v(&["cp", "-iRp", "--"]), v(&["."]))
+        );
+        assert_eq!(
+            selection_argv(Action::Mv, 0),
+            (v(&["mv", "-i", "--"]), v(&["."]))
+        );
+        assert_eq!(
+            selection_argv(Action::RmRf, b'f'),
+            (v(&["rm", "-fvr", "--"]), vec![])
+        );
+        assert_eq!(
+            selection_argv(Action::Trash, b'i'),
+            (v(&["rm", "-ivr", "--"]), vec![])
+        );
+    }
+
+    #[test]
+    fn selection_uses_native_when_tool_missing() {
+        let has: fn(&[u8]) -> bool = |t| t == b"cp";
+        assert_eq!(cpmvrm_route(Action::Cp, has), Route::Coreutils);
+        assert_eq!(cpmvrm_route(Action::Mv, has), Route::Native);
+        assert_eq!(cpmvrm_route(Action::RmRf, has), Route::Native);
+        let all: fn(&[u8]) -> bool = |_| true;
+        assert_eq!(cpmvrm_route(Action::Trash, all), Route::Coreutils);
+    }
+
+    /// Runs one chunk as `spawn_argv` would (through `platform::command`), in `cwd`, with
+    /// `input` on stdin; the exit code.
+    #[cfg(windows)]
+    fn run_chunk(argv: &[Vec<u8>], cwd: &std::path::Path, input: &[u8]) -> i32 {
+        use std::process::Stdio;
+        let mut cmd = platform::command(argv, 1);
+        cmd.current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait().unwrap().code().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nnn-cu-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[cfg(windows)]
+    fn pb(p: &std::path::Path) -> Vec<u8> {
+        platform::into_bytes(p.as_os_str().to_owned())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Microsoft Coreutils"]
+    fn coreutils_cp_declined_overwrite_keeps_target() {
+        let d = scratch("decline");
+        let (src, dst) = (d.join("src"), d.join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("f"), b"a").unwrap();
+        std::fs::write(dst.join("f"), b"b").unwrap();
+        let (head, tail) = selection_argv(Action::Cp, 0);
+        let chunks = chunk_argv(&head, &[pb(&src.join("f"))], &tail, WIN_CMDLINE_MAX);
+        assert_eq!(run_chunk(&chunks[0], &dst, b"n\n"), 1);
+        assert_eq!(std::fs::read(dst.join("f")).unwrap(), b"b");
+    }
+
+    #[cfg(windows)]
+    fn calc_processes() -> usize {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq calc*"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("calc"))
+            .count()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Microsoft Coreutils"]
+    fn coreutils_hostile_names() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let d = scratch("hostile");
+        let (src, dst) = (d.join("src"), d.join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut names: Vec<OsString> = ["a&calc.exe", "100%", "-rf", " x y "]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        names.push(OsString::from_wide(&[0x61, 0xD800]));
+        for n in &names {
+            std::fs::write(src.join(n), b"x").unwrap();
+        }
+        let items: Vec<Vec<u8>> = names.iter().map(|n| pb(&src.join(n))).collect();
+        let calc = calc_processes();
+
+        let (head, tail) = selection_argv(Action::Cp, 0);
+        for c in chunk_argv(&head, &items, &tail, WIN_CMDLINE_MAX) {
+            assert_eq!(run_chunk(&c, &dst, b""), 0);
+        }
+        assert!(names.iter().all(|n| dst.join(n).is_file()));
+
+        let (head, tail) = selection_argv(Action::RmRf, b'f');
+        for c in chunk_argv(&head, &items, &tail, WIN_CMDLINE_MAX) {
+            assert_eq!(run_chunk(&c, &src, b""), 0);
+        }
+        assert_eq!(std::fs::read_dir(&src).unwrap().count(), 0);
+        assert_eq!(calc_processes(), calc);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Microsoft Coreutils"]
+    fn coreutils_rm_chunks_many_files() {
+        let d = scratch("many");
+        let items: Vec<Vec<u8>> = (0..2000)
+            .map(|i| {
+                let p = d.join(format!("{i:040}"));
+                std::fs::write(&p, b"").unwrap();
+                pb(&p)
+            })
+            .collect();
+        let (head, tail) = selection_argv(Action::RmRf, b'f');
+        let chunks = chunk_argv(&head, &items, &tail, WIN_CMDLINE_MAX);
+        assert!(chunks.len() >= 2);
+        for c in &chunks {
+            assert_eq!(run_chunk(c, &d, b""), 0);
+        }
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+    }
 
     #[test]
     fn counts_entries() {

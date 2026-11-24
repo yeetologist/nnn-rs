@@ -2897,8 +2897,7 @@ impl Nnn {
             return false;
         }
         if !use_trash {
-            #[cfg(unix)]
-            {
+            if cfg!(unix) || platform::has_coreutil(b"rm") {
                 let opts = [b'-', b'v', b'r', r];
                 self.spawn(
                     b"rm",
@@ -2907,11 +2906,12 @@ impl Nnn {
                     Some(fpath),
                     F_NORMAL | crate::popup::F_CHKRTN,
                 );
-            }
-            // Windows has no rm: the entry is removed here.
-            #[cfg(windows)]
-            if let Err(e) = self.remove_native(fpath, r == b'f') {
-                self.printwait(sys::strerror(&e).as_bytes(), None);
+            } else {
+                // Windows without Coreutils' rm: the entry is removed here.
+                #[cfg(windows)]
+                if let Err(e) = self.remove_native(fpath, r == b'f') {
+                    self.printwait(sys::strerror(&e).as_bytes(), None);
+                }
             }
         } else {
             let t = self.trashcmd.clone().unwrap_or_default();

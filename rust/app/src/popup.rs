@@ -783,14 +783,28 @@ impl Nnn {
         };
         let words = argv.len();
         argv.extend([arg1, arg2, arg3].into_iter().flatten().map(<[u8]>::to_vec));
+        self.spawn_argv(&argv, words, None, flag)
+    }
 
+    /// `spawn` of a ready `argv` (`argv[..words]` is the command, see `platform::command`),
+    /// run in `cwd` when given: each file name stays one argument, however many there are.
+    pub fn spawn_argv(
+        &mut self,
+        argv: &[Vec<u8>],
+        words: usize,
+        cwd: Option<&[u8]>,
+        flag: u16,
+    ) -> i32 {
         if flag & F_NORMAL != 0
             && let Some(cs) = self.curses.as_mut()
         {
             cs.endwin(); // exitcurses()
         }
 
-        let mut cmd = platform::command(&argv, words);
+        let mut cmd = platform::command(argv, words);
+        if let Some(d) = cwd {
+            cmd.current_dir(platform::path(d));
+        }
         if flag & F_NOTRACE != 0 {
             // Suppress stdout and stderr
             if flag & F_NOSTDIN != 0 {
