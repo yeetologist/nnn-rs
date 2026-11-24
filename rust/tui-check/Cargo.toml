@@ -1,0 +1,16 @@
+[package]
+name = "tui-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The screen harness of rust/tui-cases without tmux: a pty (ConPTY on Windows) and a vt100 emulator"
+
+[dependencies]
+portable-pty = "0.9"
+vt100 = "0.16"
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+sha1_smol = "1"
+tempfile = "3"
+
+[workspace]

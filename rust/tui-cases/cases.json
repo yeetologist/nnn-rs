@@ -613,6 +613,9 @@
  },
  {
   "name": "file-info",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "j",
@@ -782,6 +785,9 @@
  },
  {
   "name": "quitcd",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "j",
@@ -960,6 +966,9 @@
  },
  {
   "name": "archive-current",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "j",
@@ -1036,6 +1045,9 @@
  },
  {
   "name": "plugin-startup",
+  "platforms": [
+   "unix"
+  ],
   "args": [
    "-P",
    "t"
@@ -1066,6 +1078,9 @@
  },
  {
   "name": "cmd-prompt",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "]",
@@ -1095,6 +1110,9 @@
  },
  {
   "name": "shell",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "!",
@@ -1124,6 +1142,9 @@
  },
  {
   "name": "batch-rename",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "env": {
    "EDITOR": "sed -i s/alpha/omega/",
@@ -1154,6 +1175,9 @@
  },
  {
   "name": "edit-selection",
+  "platforms": [
+   "unix"
+  ],
   "args": [
    "-p",
    "{home}/sel"
@@ -1190,6 +1214,9 @@
  },
  {
   "name": "du-mode",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "t",
@@ -1223,6 +1250,9 @@
  },
  {
   "name": "du-apparent",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "t",
@@ -1255,6 +1285,9 @@
  },
  {
   "name": "unmount-nothing",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "u",
@@ -1333,6 +1366,9 @@
  },
  {
   "name": "chmod-x",
+  "platforms": [
+   "unix"
+  ],
   "args": [],
   "keys": [
    "G",

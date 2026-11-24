@@ -6,6 +6,7 @@ Proof suites (run in WSL Ubuntu, repo /mnt/d/Documents/Github/nnn-rs, ADR-002):
 - `rust-anything app replay . --build rust/app/target/debug/nnn`
 - `python3 rust/bytes-check.py rust/app/target/debug/nnn` (needs the C build: `make -C reference/nnn`; default original is reference/nnn/nnn)
 - `python3 rust/tui-cases/harness.py check $(pwd)/rust/app/target/debug/nnn` (tmux, ADR-016; `record $(pwd)/reference/nnn/nnn` re-records from the original)
+- `cargo run --manifest-path rust/tui-check/Cargo.toml -- check $(pwd)/rust/app/target/debug/nnn` (the same cases through a pty + vt100, no tmux; also runs on Windows against `rust\app\target\debug\nnn.exe`; rust/tui-cases/README.md)
 - `rust-anything app replay .` replays the cases against the original (`run` = reference/nnn/nnn)
 - function oracles: `rust/oracle/run.sh rust/app/target/release/oracle` (needs `cd rust/app && cargo build --release --features oracles`) and the per-module *_run.* scripts
 Open: user confirmation of ADR-012 and ADR-014; cutover is the user's (rust/cutover.sh). Possible next work: a reshape pass (idiomatic Rust, merging modules), icon builds, macOS/BSD.
