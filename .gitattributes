@@ -1,4 +1,5 @@
 * text=auto eol=lf
 rust/app-cases/** -text
+rust/app-cases-windows/** -text
 rust/argv0-cases/** -text
 rust/tui-cases/expected/** -text

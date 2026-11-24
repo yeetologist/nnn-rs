@@ -20,8 +20,8 @@ pub const LIST_INPUT_MAX: usize = LIST_FILES_MAX * PATH_MAX;
 const CHUNK: usize = 512 * 1024;
 /// \`XDELAY_INTERVAL_MS\` (in microseconds, as the original uses it).
 const XDELAY_INTERVAL_MS: u64 = 350_000;
-/// \`utils[UTIL_RM_RF]\`
-const UTIL_RM_RF: [&str; 2] = ["rm", "-rf"];
+/// Windows creates symbolic links only with Developer Mode on (or as administrator).
+const MSG_NO_SYMLINKS: &[u8] = b"list mode needs symlinks: enable Developer Mode";
 
 /// \`messages[MSG_0_ENTRIES]\`
 pub const MSG_0_ENTRIES: &[u8] = b"0 entries";
@@ -166,13 +166,7 @@ impl Nnn {
     /// \`rmlistpath()\`: removes the list-mode temp tree (\`rm -rf\`, output suppressed).
     pub fn rmlistpath(&mut self) {
         if let Some(lp) = self.listpath.take() {
-            // spawn(utils[UTIL_RM_RF], listpath, NULL, NULL, F_NOTRACE | F_MULTI)
-            let _ = std::process::Command::new(UTIL_RM_RF[0])
-                .arg(UTIL_RM_RF[1])
-                .arg(&*crate::platform::os(&lp))
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            platform::remove_tree(&lp);
         }
     }
 
@@ -213,7 +207,17 @@ impl Nnn {
             }
 
             let is_dir = info.is_some_and(|i| i.mode & 0o170000 == 0o040000);
-            let _ = platform::symlink(p, &tmpdir, is_dir);
+            // An entry that is already there fails as in the original; on Windows a link
+            // nobody may create ends list mode.
+            if let Err(e) = platform::symlink(p, &tmpdir, is_dir)
+                && Os::CURRENT == Os::Windows
+                && e.kind() == std::io::ErrorKind::PermissionDenied
+            {
+                self.rmlistpath();
+                self.exitcurses();
+                msg(MSG_NO_SYMLINKS);
+                std::process::exit(1);
+            }
         }
 
         // Get the dir in which to start
@@ -409,13 +413,17 @@ mod tests {
         assert_eq!(p, b"//srv/share/");
     }
 
-    // W7 Task 6: list mode's temp tree needs symlinks and rm -rf (Unix only so far).
-    #[cfg(unix)]
     #[test]
     fn tmp_tree_from_pipe() {
         let base = std::env::temp_dir().join(format!("nnn-listmode-{}", std::process::id()));
         let fx = base.join("fx");
         std::fs::create_dir_all(fx.join("d/e")).unwrap();
+        let probe = crate::platform::bytes(base.join("probe").as_os_str()).to_vec();
+        if crate::platform::symlink(b"fx", &probe, true).is_err() {
+            // Windows without Developer Mode: make_tmp_tree would exit.
+            std::fs::remove_dir_all(&base).unwrap();
+            return;
+        }
         std::fs::write(fx.join("d/e/f"), b"").unwrap();
         std::fs::write(fx.join("d/g"), b"").unwrap();
         let fxb = crate::platform::bytes(fx.as_os_str()).to_vec();
@@ -431,15 +439,13 @@ mod tests {
         assert_eq!(n.listpath.as_deref(), Some(root.as_slice()));
         // "missing/x" still counts towards the common directory.
         assert_eq!(n.listroot.as_deref(), Some(fxb.as_slice()));
+        let link = |rel: &str| {
+            crate::platform::readlink(&[&root[..], b"/", rel.as_bytes()].concat()).unwrap()
+        };
+        let target = |rel: &str| [&fxb[..], b"/", rel.as_bytes()].concat();
+        assert_eq!(link("d/g"), target("d/g"));
+        assert_eq!(link("d/e/f"), target("d/e/f"));
         let root = std::path::PathBuf::from(&*crate::platform::os(&root));
-        assert_eq!(
-            std::fs::read_link(root.join("d/g")).unwrap(),
-            fx.join("d/g")
-        );
-        assert_eq!(
-            std::fs::read_link(root.join("d/e/f")).unwrap(),
-            fx.join("d/e/f")
-        );
         // "d/e" came after "d/e/f" made the directory: no link.
         assert!(std::fs::read_link(root.join("d/e")).is_err());
         assert!(!root.join("missing").exists());

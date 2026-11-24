@@ -4,7 +4,7 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::browse::{MESSAGES, MSG_FAILED, xdiraccess};
+use crate::browse::{MESSAGES, MSG_FAILED, MSG_NOT_SUPPORTED, xdiraccess};
 use crate::config::{
     TOK_MNT, TOKS, cstr, is_prefix, is_suffix, mkpath, xbasename, xdirname, xmktree_io,
 };
@@ -32,7 +32,6 @@ const UTIL_TAR: &[u8] = b"tar";
 const UTIL_SSHFS: &[u8] = b"sshfs";
 const UTIL_RCLONE: &[u8] = b"rclone";
 const UTIL_ARCHMNT: &[u8] = b"archivemount";
-const UTIL_SH_EXEC: &[u8] = b"sh -c";
 
 /// `archive_cmd[]`
 const ARCHIVE_CMD: [&[u8]; 4] = [b"atool -a", b"bsdtar -acvf", b"zip -r", b"tar -acvf"];
@@ -184,7 +183,13 @@ impl Nnn {
         buf.extend_from_slice(b" < ");
         buf.extend_from_slice(&selpath_esc);
 
-        self.spawn(UTIL_SH_EXEC, Some(&buf), None, None, F_CLI | F_CONFIRM);
+        self.spawn(
+            crate::platform::shell_exec_prefix(),
+            Some(&buf),
+            None,
+            None,
+            F_CLI | F_CONFIRM,
+        );
 
         if let Some(t) = tmpfile {
             sys::unlink(&t);
@@ -275,6 +280,10 @@ impl Nnn {
     /// `archive_mount`: mount the hovered archive under `<cfgpath>/mounts`; `newpath` is
     /// the mount point.
     pub fn archive_mount(&mut self, newpath: &mut Vec<u8>) -> bool {
+        if !platform::SUPPORTS_MOUNTS {
+            self.printwait(MESSAGES[MSG_NOT_SUPPORTED], None);
+            return false;
+        }
         let cmd = xgetenv("NNN_ARCHMNT", Some(UTIL_ARCHMNT)).unwrap_or_default();
         let name = self
             .pdents
@@ -311,6 +320,10 @@ impl Nnn {
     /// `remote_mount`: mount a remote with sshfs or rclone under `<cfgpath>/mounts`;
     /// `newpath` is the mount point.
     pub fn remote_mount(&mut self, newpath: &mut Vec<u8>) -> bool {
+        if !platform::SUPPORTS_MOUNTS {
+            self.printwait(MESSAGES[MSG_NOT_SUPPORTED], None);
+            return false;
+        }
         let mut flag = F_CLI;
         let r = self.getutil(UTIL_RCLONE);
         let s = self.getutil(UTIL_SSHFS);
@@ -385,6 +398,10 @@ impl Nnn {
         presel: &mut i32,
         currentpath: &[u8],
     ) -> bool {
+        if !platform::SUPPORTS_MOUNTS {
+            self.printwait(MESSAGES[MSG_NOT_SUPPORTED], Some(presel));
+            return false;
+        }
         // On Ubuntu it's fusermount; the original's check runs until it falls back.
         if !FUSERMOUNT_OLD.load(Ordering::Relaxed) && !self.getutil(b"fusermount3") {
             FUSERMOUNT_OLD.store(true, Ordering::Relaxed);

@@ -20,8 +20,6 @@ const MSG_CANCEL: usize = 4;
 const MSG_CP_MV_AS: usize = 7;
 const MSG_INVALID_KEY: usize = 40;
 
-/// `utils[UTIL_SH_EXEC]`
-const UTIL_SH_EXEC: &[u8] = b"sh -c";
 /// `SED` (Linux).
 const SED: &str = "sed";
 /// `cp`, `mv` and their `-r` (advcpmv) variants `PROGRESS_CP`, `PROGRESS_MV`.
@@ -199,7 +197,13 @@ impl Nnn {
 
     /// `spawn_sh_exec`
     pub fn spawn_sh_exec(&mut self, cmd: &[u8]) {
-        self.spawn(UTIL_SH_EXEC, Some(cmd), None, None, F_CLI);
+        self.spawn(
+            crate::platform::shell_exec_prefix(),
+            Some(cmd),
+            None,
+            None,
+            F_CLI,
+        );
     }
 
     /// `editselection`: edit the selection list in the editor.
@@ -405,7 +409,13 @@ impl Nnn {
         let path_esc = &esc[1..esc.len() - 1];
 
         let buf = p_cpmvrnm(path_esc, &tmp, cmd);
-        self.spawn(UTIL_SH_EXEC, Some(&buf), None, None, F_CLI | F_CHKRTN) == 0
+        self.spawn(
+            crate::platform::shell_exec_prefix(),
+            Some(&buf),
+            None,
+            None,
+            F_CLI | F_CHKRTN,
+        ) == 0
     }
 
     /// `cpmvrm_selection`: copy, move, copy/move as, trash or remove the selection.
@@ -452,7 +462,13 @@ impl Nnn {
         };
 
         if sel != Action::Cpmvas
-            && self.spawn(UTIL_SH_EXEC, Some(&g_buf), None, None, F_CLI | F_CHKRTN) != 0
+            && self.spawn(
+                crate::platform::shell_exec_prefix(),
+                Some(&g_buf),
+                None,
+                None,
+                F_CLI | F_CHKRTN,
+            ) != 0
         {
             self.printmsg(MESSAGES[MSG_FAILED]);
             return false;

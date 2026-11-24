@@ -20,8 +20,6 @@ const MSG_0_SELECTED: &[u8] = b"0 selected";
 const MSG_CUR_SEL_OPTS: &[u8] = b"'c'urrent/'s'el?";
 const MSG_SEL_MISSING: &[u8] = b"open failed";
 const MSG_RM_TMP: &[u8] = b"remove tmp file?";
-/// `utils[UTIL_SH_EXEC]`.
-const UTIL_SH_EXEC: &[u8] = b"sh -c";
 
 /// One write(2), true when all of `buf` went out (as `write(fd, buf, n) == n`).
 fn write_once(f: &mut dyn Write, buf: &[u8]) -> bool {
@@ -197,7 +195,13 @@ impl Nnn {
         cmd.extend_from_slice(cstr(self.selpath.as_deref().unwrap_or_default()));
         cmd.push(b'\'');
         cmd.truncate(crate::config::CMD_LEN_MAX - 1);
-        self.spawn(UTIL_SH_EXEC, Some(&cmd), None, None, F_CLI | F_CONFIRM);
+        self.spawn(
+            crate::platform::shell_exec_prefix(),
+            Some(&cmd),
+            None,
+            None,
+            F_CLI | F_CONFIRM,
+        );
         true
     }
 

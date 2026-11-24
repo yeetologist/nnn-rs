@@ -163,6 +163,8 @@ pub struct Nnn {
     pub middle_click_key: i32,
 
     pub opener: Vec<u8>,
+    /// The default opener holds its own arguments (spawned with `F_MULTI`).
+    pub opener_multi: bool,
     pub editor: Vec<u8>,
     pub enveditor: Vec<u8>,
     pub pager: Vec<u8>,

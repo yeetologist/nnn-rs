@@ -308,9 +308,85 @@ pub fn wait_status(st: std::process::ExitStatus) -> i32 {
     backend::wait_status(st)
 }
 
-/// Both ends of a pipe set to `O_NONBLOCK`.
-pub fn set_pipe_nonblocking(r: &io::PipeReader, w: &io::PipeWriter) {
-    backend::set_pipe_nonblocking(r, w);
+/// The programs nnn runs when `NNN_OPENER`, `VISUAL`/`EDITOR`, `PAGER` and `SHELL` name none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Defaults {
+    /// Holds its own arguments when it contains a blank (`spawn` with `F_MULTI`).
+    pub opener: Vec<u8>,
+    pub editor: Vec<u8>,
+    pub pager: Vec<u8>,
+    pub shell: Vec<u8>,
+}
+
+/// Unix: `xdg-open`, `vi`, `less`, `sh`; Windows: `cmd /C start ""`, `notepad`, `more`,
+/// `%COMSPEC%`.
+pub fn defaults() -> Defaults {
+    backend::defaults()
+}
+
+/// `utils[UTIL_SH_EXEC]`, the command that runs a command line: `sh -c` (on Windows only
+/// when `sh.exe` is on `PATH`, as Git for Windows puts it; else `cmd /C`).
+pub fn shell_exec_prefix() -> &'static [u8] {
+    backend::shell_exec_prefix()
+}
+
+/// `sh` is there to run script plugins (always on Unix).
+pub fn has_sh() -> bool {
+    backend::has_sh()
+}
+
+/// Named pipes for `NNN_FIFO` and the plugin control pipe.
+pub const SUPPORTS_FIFO: bool = backend::SUPPORTS_FIFO;
+/// FUSE mounts (archivemount, sshfs, rclone) and unmounting them.
+pub const SUPPORTS_MOUNTS: bool = backend::SUPPORTS_MOUNTS;
+/// Execute bits to toggle.
+pub const SUPPORTS_CHMOD: bool = backend::SUPPORTS_CHMOD;
+
+/// `cmd` or `cmd.exe` (any case, any directory) on Windows: a program that takes its
+/// command line as it is instead of as C-style arguments.
+fn is_cmd(prog: &[u8]) -> bool {
+    let name = prog
+        .rsplit(|&c| c == b'/' || c == b'\\')
+        .next()
+        .unwrap_or(prog)
+        .to_ascii_lowercase();
+    Os::CURRENT == Os::Windows && (name == b"cmd" || name == b"cmd.exe")
+}
+
+/// The option that makes `shell` run one command line: `/C` for `cmd`, else `-c`.
+pub fn shell_command_flag(shell: &[u8]) -> &'static [u8] {
+    if is_cmd(shell) { b"/C" } else { b"-c" }
+}
+
+/// `execvp(argv[0], argv)` as a `Command` (looked up in `PATH`; each string ends at its
+/// first NUL, as a C string does); on Windows the arguments of `cmd` go on its command line
+/// as they are (quoted only when they hold a blank).
+pub fn command(argv: &[Vec<u8>]) -> std::process::Command {
+    let c = |a: &[u8]| {
+        a.iter()
+            .position(|&b| b == 0)
+            .map_or(a, |n| &a[..n])
+            .to_vec()
+    };
+    let argv: Vec<Vec<u8>> = argv.iter().map(|a| c(a)).collect();
+    let mut cmd = std::process::Command::new(&*os(&argv[0]));
+    if is_cmd(&argv[0]) {
+        backend::cmd_args(&mut cmd, &argv[1..]);
+    } else {
+        cmd.args(argv[1..].iter().map(|a| os(a)));
+    }
+    cmd
+}
+
+/// `gethostname()` (Windows: `%COMPUTERNAME%`); empty when unknown.
+pub fn hostname() -> Vec<u8> {
+    backend::hostname()
+}
+
+/// `rm -rf path` with its output suppressed (Windows removes the tree itself; links in it
+/// are removed, not followed).
+pub fn remove_tree(path: &[u8]) {
+    backend::remove_tree(path);
 }
 
 /// The `statvfs` fields `get_fs_info` uses.
@@ -428,6 +504,30 @@ mod tests {
         assert_eq!(xdirname_with(Os::Unix, b"/a"), b"/");
         assert_eq!(xdirname_with(Os::Unix, b"/a/b"), b"/a");
         assert_eq!(xdirname_with(Os::Unix, b"rel"), b"rel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_defaults() {
+        let d = defaults();
+        let all = [&d.opener[..], &d.editor[..], &d.pager[..], &d.shell[..]];
+        assert_eq!(all, [&b"xdg-open"[..], b"vi", b"less", b"sh"]);
+        assert_eq!(shell_exec_prefix(), b"sh -c");
+    }
+
+    #[test]
+    fn cmd_is_known_only_on_windows() {
+        let win = Os::CURRENT == Os::Windows;
+        assert_eq!(is_cmd(b"cmd"), win);
+        assert_eq!(is_cmd(b"C:\\WINDOWS\\system32\\CMD.EXE"), win);
+        assert_eq!(is_cmd(b"C:/Windows/cmd.exe"), win);
+        assert!(!is_cmd(b"sh"));
+        assert!(!is_cmd(b"/usr/bin/cmdx"));
+        assert_eq!(shell_command_flag(b"sh"), b"-c");
+        assert_eq!(
+            shell_command_flag(b"cmd.exe"),
+            if win { &b"/C"[..] } else { b"-c" }
+        );
     }
 
     #[test]

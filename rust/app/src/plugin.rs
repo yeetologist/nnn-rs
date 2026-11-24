@@ -5,21 +5,22 @@
 //! run_plugin() forks in the original; the child holds the write end of the plugin FIFO open
 //! while it runs the plugin, the parent reads the FIFO. Here a thread plays the child (it
 //! owns the write end and runs the plugin), so the main thread reads the FIFO exactly as the
-//! original's parent does.
+//! original's parent does. Without FIFOs (Windows) NNN_PIPE is a regular file: the plugin runs
+//! first, then its request is read from the file.
 
 use crate::browse::MESSAGES;
 use crate::config::{CMD_LEN_MAX, cstr, mkpath, xbasename, xdirname};
 use crate::draw::strsncpy;
 use crate::keys::Action;
 use crate::locale::setenv;
-use crate::popup::{F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, F_PAGE, F_WINDOW};
+use crate::platform::Os;
+use crate::popup::{
+    F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, F_PAGE, F_WINDOW, parseargs,
+};
 use crate::prompt::{INVALID_POS, PROMPT};
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX};
-use std::borrow::Cow;
-use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::process::Command;
 
 /// `messages[MSG_ENTER]`
 const MSG_ENTER: usize = 22;
@@ -27,8 +28,6 @@ const MSG_ENTER: usize = 22;
 const MSG_APP_NAME: usize = 32;
 /// `utils[UTIL_LAUNCH]`
 const UTIL_LAUNCH: &[u8] = b"launch";
-/// `utils[UTIL_SH_EXEC]`
-const UTIL_SH_EXEC: &[u8] = b"sh -c";
 /// `utils[UTIL_FZF]`
 const UTIL_FZF: &[u8] = b"fzf";
 /// `envs[ENV_NCUR]`
@@ -39,10 +38,8 @@ const NNN_PIPE: &str = "NNN_PIPE";
 const NNNLVL: &str = "NNNLVL";
 /// `TMP_LEN_MAX`
 const TMP_LEN_MAX: usize = 64;
-
-fn os(b: &[u8]) -> Cow<'_, OsStr> {
-    crate::platform::os(cstr(b))
-}
+/// Script plugins need `sh` on Windows.
+const MSG_NO_SH: &[u8] = b"sh not found (Git for Windows)";
 
 /// `xitoa` of an unsigned value.
 fn xitoa(v: u32) -> Vec<u8> {
@@ -127,12 +124,10 @@ struct ChildJob {
 }
 
 impl ChildJob {
-    /// The child of run_plugin(): holds `wfd` open while `spawn` runs the job (flag 0 or
-    /// `F_MULTI` [| `F_CONFIRM`]: no curses), then closes it.
-    fn run(self, wfd: File) {
-        let mut cmd = Command::new(os(&self.argv[0]));
-        cmd.args(self.argv[1..].iter().map(|a| os(a)));
-        let _ = cmd.status();
+    /// The child of run_plugin(): holds `wfd` (the FIFO's write end, if any) open while
+    /// `spawn` runs the job (flag 0 or `F_MULTI` [| `F_CONFIRM`]: no curses), then closes it.
+    fn run(self, wfd: Option<File>) {
+        let _ = crate::platform::command(&self.argv).status();
         if self.confirm {
             let mut out = std::io::stdout();
             let _ = out.write_all(MESSAGES[MSG_ENTER]);
@@ -189,9 +184,19 @@ impl Nnn {
         let (g_buf, flags) = cmd_as_plugin_line(file, flags);
 
         if flags & F_PAGE != 0 {
-            self.get_output(UTIL_SH_EXEC, Some(&g_buf), None, None, true);
+            self.get_output(
+                crate::platform::shell_exec_prefix(),
+                Some(&g_buf),
+                None,
+                None,
+                true,
+            );
         } else if flags & F_WINDOW != 0 {
-            if let Some(content) = self.buffer_command_output(&[UTIL_SH_EXEC], Some(&g_buf), None) {
+            if let Some(content) = self.buffer_command_output(
+                &[crate::platform::shell_exec_prefix()],
+                Some(&g_buf),
+                None,
+            ) {
                 self.show_content_in_floating_window(
                     &content,
                     action,
@@ -199,11 +204,30 @@ impl Nnn {
                 );
             }
         } else {
-            self.spawn(UTIL_SH_EXEC, Some(&g_buf), None, None, flags);
+            self.spawn(
+                crate::platform::shell_exec_prefix(),
+                Some(&g_buf),
+                None,
+                None,
+                flags,
+            );
         }
     }
 
-    /// `g_pipepath`: the plugin control FIFO.
+    /// Script plugins run through `sh` on Windows: false, after saying so, when there is
+    /// none (a "!cmd" needs no `sh`).
+    pub fn script_plugin_runnable(&mut self, file: &[u8], presel: &mut i32) -> bool {
+        if Os::CURRENT != Os::Windows
+            || cstr(file).first() == Some(&b'!')
+            || crate::platform::has_sh()
+        {
+            return true;
+        }
+        self.printwait(MSG_NO_SH, Some(presel));
+        false
+    }
+
+    /// `g_pipepath`: the plugin control FIFO (a regular file without FIFOs).
     fn g_pipepath(&self) -> Vec<u8> {
         pipepath(&self.g_tmpfpath, std::process::id())
     }
@@ -381,21 +405,34 @@ impl Nnn {
         }
 
         let pipe = self.g_pipepath();
-        if crate::platform::mkfifo(&pipe).is_err() {
+        if crate::platform::SUPPORTS_FIFO {
+            if crate::platform::mkfifo(&pipe).is_err() {
+                return false;
+            }
+        } else if File::create(crate::platform::path(&pipe)).is_err() {
+            // NNN_PIPE is a regular file, empty until the plugin writes its request.
             return false;
         }
 
         // The child's job, built here as the forked child would.
         let job = if cmd_as_plugin {
             let (g_buf, flags) = cmd_as_plugin_line(file, flags);
+            // INFALLIBLE: the prefix is two words.
+            let mut argv = parseargs(crate::platform::shell_exec_prefix()).unwrap_or_default();
+            argv.push(g_buf);
             ChildJob {
-                argv: vec![b"sh".to_vec(), b"-c".to_vec(), g_buf],
+                argv,
                 confirm: flags & F_CONFIRM != 0,
             }
         } else {
             // Generate absolute path to plugin
             let (plugin, _) = mkpath(&self.plgpath, file, &self.home);
-            let mut argv = vec![plugin];
+            // Windows cannot run a script itself: sh (Git for Windows) does.
+            let mut argv = if Os::CURRENT == Os::Windows {
+                vec![b"sh".to_vec(), plugin]
+            } else {
+                vec![plugin]
+            };
             if let Some(rf) = runfile.filter(|r| !cstr(r).is_empty()) {
                 argv.push(strsncpy(rf, NAME_MAX));
             }
@@ -411,12 +448,18 @@ impl Nnn {
 
         self.exitcurses();
 
-        // Both ends are opened here without blocking (the read end first, so opening the
-        // write end succeeds); then they block as the original's do.
-        let (mut rfd, wfd) = crate::platform::open_fifo_pair(&pipe);
-
-        // In child (a thread here); when its open fails it exits at once.
-        let child = wfd.map(|w| std::thread::spawn(move || job.run(w)));
+        let (mut rfd, child) = if crate::platform::SUPPORTS_FIFO {
+            // Both ends are opened here without blocking (the read end first, so opening the
+            // write end succeeds); then they block as the original's do.
+            let (rfd, wfd) = crate::platform::open_fifo_pair(&pipe);
+            // In child (a thread here); when its open fails it exits at once.
+            let child = wfd.map(|w| std::thread::spawn(move || job.run(Some(w))));
+            (rfd, child)
+        } else {
+            // The request in the file is read once the plugin is done.
+            job.run(None);
+            (File::open(crate::platform::path(&pipe)).ok(), None)
+        };
 
         openfile.clear();
         let nextpath = match &mut rfd {
@@ -550,7 +593,8 @@ impl Nnn {
 
             let shell = self.shell.clone();
             let arg = if xargs { &cmd } else { &cmdline };
-            let cmd_ret = self.spawn(&shell, Some(b"-c"), Some(arg), None, F_CLI | F_CONFIRM);
+            let flag = crate::platform::shell_command_flag(&shell);
+            let cmd_ret = self.spawn(&shell, Some(flag), Some(arg), None, F_CLI | F_CONFIRM);
             if xargs && cmd_ret == 0 {
                 self.clearselection();
             }

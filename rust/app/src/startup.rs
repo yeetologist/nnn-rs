@@ -53,6 +53,16 @@ fn rust_tui(st: Opts, operands: &[Vec<u8>]) -> u8 {
         ..Default::default()
     };
     nnn.g_tmpfpath = crate::platform::temp_dir().unwrap_or_default();
+    if !crate::platform::SUPPORTS_FIFO
+        && (st.autofifo || std::env::var_os("NNN_FIFO").is_some_and(|v| !v.is_empty()))
+    {
+        let mut e = std::io::stderr();
+        let _ = e.write_all(b"nnn: NNN_FIFO: ");
+        let _ = e.write_all(crate::browse::MESSAGES[crate::browse::MSG_NOT_SUPPORTED]);
+        let _ = e.write_all(b"\n");
+        cleanup(&st);
+        return 1;
+    }
     if !nnn.list_mode_main() {
         cleanup(&st);
         return 1;

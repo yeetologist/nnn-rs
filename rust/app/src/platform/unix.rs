@@ -1,6 +1,6 @@
 //! The Unix backend: byte paths are the OS's own bytes.
 
-use super::{DType, Errno, FileInfo, FsBlocks, ReadResult, SignalStep};
+use super::{DType, Defaults, Errno, FileInfo, FsBlocks, ReadResult, SignalStep};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat};
@@ -299,12 +299,51 @@ pub fn wait_status(st: ExitStatus) -> i32 {
     st.code().unwrap_or_else(|| st.into_raw())
 }
 
-pub fn set_pipe_nonblocking(r: &io::PipeReader, w: &io::PipeWriter) {
-    for fd in [r.as_fd(), w.as_fd()] {
-        if let Ok(fl) = rustix::fs::fcntl_getfl(fd) {
-            let _ = rustix::fs::fcntl_setfl(fd, fl | OFlags::NONBLOCK);
-        }
+pub const SUPPORTS_FIFO: bool = true;
+pub const SUPPORTS_MOUNTS: bool = true;
+pub const SUPPORTS_CHMOD: bool = true;
+
+pub fn defaults() -> Defaults {
+    Defaults {
+        opener: b"xdg-open".to_vec(),
+        editor: b"vi".to_vec(),
+        pager: b"less".to_vec(),
+        shell: b"sh".to_vec(),
     }
+}
+
+pub fn shell_exec_prefix() -> &'static [u8] {
+    b"sh -c"
+}
+
+pub fn has_sh() -> bool {
+    true
+}
+
+pub fn cmd_args(cmd: &mut Command, args: &[Vec<u8>]) {
+    cmd.args(args.iter().map(|a| os(a)));
+}
+
+/// The kernel's host name, without its trailing newline.
+pub fn hostname() -> Vec<u8> {
+    std::fs::read("/proc/sys/kernel/hostname")
+        .map(|mut h| {
+            while h.last() == Some(&b'\n') {
+                h.pop();
+            }
+            h
+        })
+        .unwrap_or_default()
+}
+
+/// `spawn(utils[UTIL_RM_RF], path, NULL, NULL, F_NOTRACE | F_MULTI)`
+pub fn remove_tree(path: &[u8]) {
+    let _ = Command::new("rm")
+        .arg("-rf")
+        .arg(&*os(path))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 pub fn fs_blocks(path: &[u8]) -> Option<FsBlocks> {

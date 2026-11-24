@@ -79,11 +79,7 @@ const PREVIEW_MAX_LINE: usize = 4096;
 const FILE_MIME_OPTS: &[u8] = b"-biL";
 
 // utils[] entries this module uses.
-const UTIL_OPENER: &[u8] = b"xdg-open";
 const UTIL_BASH: &[u8] = b"bash";
-const UTIL_VI: &[u8] = b"vi";
-const UTIL_LESS: &[u8] = b"less";
-const UTIL_SH: &[u8] = b"sh";
 const UTIL_NTFY: &[u8] = b".ntfy";
 const UTIL_CBCP: &[u8] = b".cbcp";
 const UTIL_NMV: &[u8] = b".nmv";
@@ -116,9 +112,11 @@ const MSG_ORDER: usize = 36;
 const MSG_INVALID_KEY: usize = 40;
 const MSG_NOCHANGE: usize = 41;
 const MSG_DIR_CHANGED: usize = 42;
+/// Appended after the original's messages (Windows).
+pub(crate) const MSG_NOT_SUPPORTED: usize = 45;
 
 /// `messages[]`
-pub const MESSAGES: [&[u8]; 45] = [
+pub const MESSAGES: [&[u8]; 46] = [
     b"",
     b"0 entries",
     b"/.nnnXXXXXX",
@@ -164,6 +162,7 @@ pub const MESSAGES: [&[u8]; 45] = [
     b"dir changed, range sel off",
     b"name: ",
     b"add files with relative path?",
+    b"not supported on Windows",
 ];
 
 /// State this module keeps: the globals of nnn.c that only main(), browse() and the
@@ -595,7 +594,9 @@ impl Nnn {
         }
 
         // A custom opener.
-        self.opener = xgetenv_or("NNN_OPENER", UTIL_OPENER);
+        let defaults = platform::defaults();
+        self.opener = xgetenv_or("NNN_OPENER", &defaults.opener);
+        self.opener_multi = self.opener == defaults.opener && defaults.opener.contains(&b' ');
 
         // Bookmarks and NNN_ORDER.
         let (ok, bm) = parsekvpair(getenv("NNN_BMS").as_deref());
@@ -696,10 +697,10 @@ impl Nnn {
             self.cfg.useeditor = false;
         }
 
-        self.enveditor = xgetenv_or("EDITOR", UTIL_VI);
+        self.enveditor = xgetenv_or("EDITOR", &defaults.editor);
         self.editor = xgetenv_or("VISUAL", &self.enveditor);
-        self.pager = xgetenv_or("PAGER", UTIL_LESS);
-        self.shell = xgetenv_or("SHELL", UTIL_SH);
+        self.pager = xgetenv_or("PAGER", &defaults.pager);
+        self.shell = xgetenv_or("SHELL", &defaults.shell);
 
         // Create the FIFO.
         let mut fifopath = getenv("NNN_FIFO").filter(|p| !p.is_empty());
@@ -757,15 +758,8 @@ impl Nnn {
             let _ = out.write_all(b"\x1b[22;0t");
             let _ = out.flush();
             // gethostname()
-            self.hostname = std::fs::read("/proc/sys/kernel/hostname")
-                .map(|mut h| {
-                    while h.last() == Some(&b'\n') {
-                        h.pop();
-                    }
-                    h.truncate(255);
-                    h
-                })
-                .unwrap_or_default();
+            self.hostname = platform::hostname();
+            self.hostname.truncate(255);
         }
 
         if !self.initcurses() {
@@ -1677,6 +1671,10 @@ impl Nnn {
             A::Mfltr | A::Hidden | A::Detail | A::Preview | A::Sort => self.sel_view(b, sel),
             A::Stats | A::Chmodx => {
                 if self.ndents != 0 {
+                    if sel == A::Chmodx && !platform::SUPPORTS_CHMOD {
+                        self.printwait(MESSAGES[MSG_NOT_SUPPORTED], Some(&mut b.presel));
+                        return Flow::Nochange;
+                    }
                     let path = self.cpath();
                     let tmp = self.list_or_path(&path);
                     let ok = if sel == A::Stats {
@@ -1981,6 +1979,9 @@ impl Nnn {
             self.g_state.runplugin = false;
             // Must be in the plugin dir and the same context to pick a plugin.
             if self.g_state.runctx == self.cfg.curctx && path == self.plgpath {
+                if !self.script_plugin_runnable(&pent.name, &mut b.presel) {
+                    return Flow::Nochange;
+                }
                 self.endselection(false);
                 // Back to the earlier dir afterwards.
                 let ld = self.g_ctx[cc].c_last.clone();
@@ -2104,7 +2105,10 @@ impl Nnn {
         }
 
         // The desktop opener as the last resort.
-        let flags = self.opener_flags();
+        let mut flags = self.opener_flags();
+        if self.opener_multi {
+            flags |= F_MULTI;
+        }
         let (opener, np) = (self.opener.clone(), b.newpath.clone());
         self.spawn(&opener, Some(&np), None, None, flags);
 
@@ -2683,6 +2687,9 @@ impl Nnn {
             } else {
                 true
             };
+            if !self.script_plugin_runnable(&tmp, &mut b.presel) {
+                return Flow::Nochange;
+            }
             loop {
                 let mut action: Option<Action> = None;
                 let cn = self.curname();
@@ -3075,7 +3082,7 @@ mod tests {
         assert_eq!(fgets(&mut r).unwrap(), b"y");
     }
 
-    // W7 Task 6: NNN_FIFO on Windows.
+    // Windows has no FIFOs: NNN_FIFO is refused (rust/app-cases-windows/fifo-unsupported).
     #[cfg(unix)]
     #[test]
     fn fifo_checks() {

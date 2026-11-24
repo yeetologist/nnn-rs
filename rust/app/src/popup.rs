@@ -26,6 +26,8 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 // Flags of spawn() (nnn.c 267-279).
 pub const F_NONE: u16 = 0x00;
@@ -633,8 +635,7 @@ fn spawn_redirected(
     close_stdin: bool,
     out: &impl ChildOutput,
 ) -> io::Result<Child> {
-    let mut c = Command::new(os(&argv[0]));
-    c.args(argv[1..].iter().map(|a| os(a)));
+    let mut c = platform::command(argv);
     if close_stdin {
         c.stdin(Stdio::null());
     }
@@ -663,6 +664,38 @@ impl ChildOutput for io::PipeWriter {
 fn waitpid(mut child: Child) {
     let _ = child.wait();
 }
+
+/// A thread that reads `r` to its end, sending each chunk read.
+fn drain(mut r: io::PipeReader) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; SIZE_8KB];
+        while let Ok(n) = r.read(&mut buf)
+            && n > 0
+        {
+            // Keep reading after the receiver is gone, so the writer never blocks.
+            let _ = tx.send(buf[..n].to_vec());
+        }
+    });
+    rx
+}
+
+/// Up to `max` bytes of what `drain` reads once the command has exited: all of its output,
+/// or (when a program it started keeps the pipe open) what arrives within `OUTPUT_GRACE`.
+fn collect(rx: &mpsc::Receiver<Vec<u8>>, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while out.len() < max {
+        match rx.recv_timeout(OUTPUT_GRACE) {
+            Ok(chunk) => out.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    out.truncate(max);
+    out
+}
+
+/// How long `collect` waits for more output from a command that has exited.
+const OUTPUT_GRACE: Duration = Duration::from_millis(100);
 
 impl Nnn {
     /// `create_tmp_file`: `mkstemp("<tmpdir>/.nnnXXXXXX")`; `None` for the original's -1.
@@ -749,8 +782,7 @@ impl Nnn {
             cs.endwin(); // exitcurses()
         }
 
-        let mut cmd = Command::new(os(&argv[0]));
-        cmd.args(argv[1..].iter().map(|a| os(a)));
+        let mut cmd = platform::command(&argv);
         if flag & F_NOTRACE != 0 {
             // Suppress stdout and stderr
             if flag & F_NOSTDIN != 0 {
@@ -835,7 +867,6 @@ impl Nnn {
                 Ok(p) => p,
                 Err(e) => self.popup_errexit(5493, &e),
             };
-            platform::set_pipe_nonblocking(&r, &w);
             pipe = Some((r, w));
         }
 
@@ -856,7 +887,12 @@ impl Nnn {
             return false;
         };
 
-        // In parent
+        // In parent: only the child holds the write end now, so the reader sees EOF when it
+        // is done; it reads while the child runs so a full pipe cannot stop the child.
+        let output = pipe.map(|(r, w)| {
+            drop(w);
+            drain(r)
+        });
         waitpid(child);
 
         if let Some((f, path)) = tmp {
@@ -873,16 +909,12 @@ impl Nnn {
 
         // Case 1
         let mut ret = false;
-        if let Some((mut r, w)) = pipe {
-            let mut buf = vec![0u8; CMD_LEN_MAX - 1];
-            if let Ok(n) = r.read(&mut buf)
-                && n > 0
-            {
-                buf.truncate(n);
+        if let Some(rx) = output {
+            let buf = collect(&rx, CMD_LEN_MAX - 1);
+            if !buf.is_empty() {
                 self.popup.g_buf = buf;
                 ret = true;
             }
-            drop(w);
         }
         ret
     }
@@ -907,7 +939,9 @@ impl Nnn {
         arg1: Option<&[u8]>,
         arg2: Option<&[u8]>,
     ) -> Option<Vec<u8>> {
-        let (mut r, w) = io::pipe().ok()?;
+        let (r, w) = io::pipe().ok()?;
+        // Read while the commands run, so a full pipe cannot stop them.
+        let output = drain(r);
 
         // Execute all commands sequentially, writing to the pipe
         for command in cmds.iter().rev() {
@@ -927,11 +961,10 @@ impl Nnn {
 
         // Read directly from the pipe into the buffer
         let mut content = Vec::with_capacity(SIZE_8KB);
-        let mut read_buf = [0u8; SIZE_8KB];
         while content.len() < SIZE_16MB {
-            match r.read(&mut read_buf) {
-                Ok(n) if n > 0 => content.extend_from_slice(&read_buf[..n]),
-                _ => break,
+            match output.recv_timeout(OUTPUT_GRACE) {
+                Ok(chunk) => content.extend_from_slice(&chunk),
+                Err(_) => break,
             }
         }
 
@@ -1166,6 +1199,34 @@ mod tests {
 
     fn args(v: &[&str]) -> Option<Vec<Vec<u8>>> {
         Some(v.iter().map(|s| s.as_bytes().to_vec()).collect())
+    }
+
+    /// Case 1 of get_output with `cat`/`type` of a file through the shell prefix.
+    fn output_of_file(tag: &str, content: &[u8]) -> Option<Vec<u8>> {
+        let f = std::env::temp_dir().join(format!("nnn-get-output-{tag}-{}", std::process::id()));
+        std::fs::write(&f, content).unwrap();
+        let prefix = platform::shell_exec_prefix();
+        let line = if prefix == b"cmd /C" {
+            format!("type {}", f.display())
+        } else {
+            format!("cat {}", f.display().to_string().replace('\\', "/"))
+        };
+        let mut n = Nnn::default();
+        let out = n.get_output_buf(prefix, Some(line.as_bytes()), None);
+        let _ = std::fs::remove_file(&f);
+        out
+    }
+
+    #[test]
+    fn get_output_without_output_returns_false() {
+        assert_eq!(output_of_file("empty", b""), None);
+    }
+
+    #[test]
+    fn get_output_keeps_the_start_of_a_big_output() {
+        // More than any pipe holds: the child must not block on a full pipe.
+        let out = output_of_file("big", &vec![b'x'; 1 << 20]).unwrap();
+        assert_eq!(out, vec![b'x'; CMD_LEN_MAX - 1]);
     }
 
     #[test]

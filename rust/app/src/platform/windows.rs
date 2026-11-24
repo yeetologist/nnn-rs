@@ -1,6 +1,6 @@
 //! The Windows backend: byte paths are WTF-8 (`OsStr::as_encoded_bytes`), shown with `/`.
 
-use super::{Access, DType, Errno, FileInfo, FsBlocks, ReadResult, SignalStep};
+use super::{Access, DType, Defaults, Errno, FileInfo, FsBlocks, ReadResult, SignalStep};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -10,24 +10,29 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_STANDARD_INFO, FileBasicInfo,
     FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
 use windows_sys::Win32::System::Console::{
-    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_PROCESSED_INPUT,
+    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
+    CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_PROCESSED_INPUT,
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
     GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetStdHandle,
     INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP, SetStdHandle,
-    WINDOW_BUFFER_SIZE_EVENT,
+    STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP,
+    SetStdHandle, WINDOW_BUFFER_SIZE_EVENT,
 };
-use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, CreateEventW, DETACHED_PROCESS, INFINITE, ResetEvent, SetEvent,
+    WaitForMultipleObjects,
+};
+use windows_sys::core::BOOL;
 
 pub const NULL_DEVICE: &[u8] = b"NUL";
 pub const TTY_DEVICE: &[u8] = b"CONIN$";
@@ -274,11 +279,16 @@ pub fn symlink(target: &[u8], link: &[u8], is_dir: bool) -> io::Result<()> {
     // Link targets need \ separators to resolve.
     let target: PathBuf = super::path(target).components().collect();
     let link = super::path(link);
-    if is_dir {
+    let made = if is_dir {
         std::os::windows::fs::symlink_dir(target, link)
     } else {
         std::os::windows::fs::symlink_file(target, link)
-    }
+    };
+    // ERROR_PRIVILEGE_NOT_HELD: links need Developer Mode (or an administrator).
+    made.map_err(|e| match e.raw_os_error() {
+        Some(1314) => io::ErrorKind::PermissionDenied.into(),
+        _ => e,
+    })
 }
 
 pub fn temp_dir() -> Option<Vec<u8>> {
@@ -373,19 +383,80 @@ pub fn mkdir(path: &[u8], _mode: u32) -> io::Result<()> {
     })
 }
 
-// W7 Task 6: NNN_FIFO and the plugin control pipe on Windows.
+/// Windows has no named pipes in the file system (`SUPPORTS_FIFO`): NNN_FIFO is refused at
+/// startup and the plugin control pipe is a regular file.
+pub const SUPPORTS_FIFO: bool = false;
+/// No FUSE: archivemount, sshfs, rclone mounts and unmounting say "not supported".
+pub const SUPPORTS_MOUNTS: bool = false;
+/// No execute bits (`toggle_exec` is never asked).
+pub const SUPPORTS_CHMOD: bool = false;
+
 pub fn mkfifo(_path: &[u8]) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
-// W7 Task 6
 pub fn open_fifo_write(_path: &[u8]) -> io::Result<File> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
-// W7 Task 6
 pub fn open_fifo_pair(_path: &[u8]) -> (Option<File>, Option<File>) {
     (None, None)
+}
+
+pub fn defaults() -> Defaults {
+    let shell = std::env::var_os("COMSPEC")
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| b"cmd.exe".to_vec(), |s| bytes(&s).into_owned());
+    Defaults {
+        opener: br#"cmd /C start """#.to_vec(),
+        editor: b"notepad".to_vec(),
+        pager: b"more".to_vec(),
+        shell,
+    }
+}
+
+/// `sh -c` when a directory of `path` (a `PATH` value) holds `sh.exe`, else `cmd /C`.
+fn shell_exec_prefix_in(path: Option<&OsStr>) -> &'static [u8] {
+    let has_sh = path.is_some_and(|p| std::env::split_paths(p).any(|d| d.join("sh.exe").is_file()));
+    if has_sh { b"sh -c" } else { b"cmd /C" }
+}
+
+pub fn shell_exec_prefix() -> &'static [u8] {
+    static PREFIX: OnceLock<&'static [u8]> = OnceLock::new();
+    PREFIX.get_or_init(|| shell_exec_prefix_in(std::env::var_os("PATH").as_deref()))
+}
+
+pub fn has_sh() -> bool {
+    shell_exec_prefix() == b"sh -c"
+}
+
+/// An argument on `cmd`'s command line: as it is when it holds a quote or no blank (`""`
+/// stays an empty title for `start`), else in quotes; an empty one as `""`.
+fn cmd_arg(a: &[u8]) -> Cow<'_, [u8]> {
+    if a.is_empty() {
+        return Cow::Borrowed(b"\"\"");
+    }
+    if a.contains(&b'"') || !a.iter().any(|&c| c == b' ' || c == b'\t') {
+        return Cow::Borrowed(a);
+    }
+    Cow::Owned([&b"\""[..], a, b"\""].concat())
+}
+
+pub fn cmd_args(cmd: &mut Command, args: &[Vec<u8>]) {
+    use std::os::windows::process::CommandExt;
+    for a in args {
+        cmd.raw_arg(&*os(&cmd_arg(a)));
+    }
+}
+
+pub fn hostname() -> Vec<u8> {
+    std::env::var_os("COMPUTERNAME")
+        .map(|h| bytes(&h).into_owned())
+        .unwrap_or_default()
+}
+
+pub fn remove_tree(path: &[u8]) {
+    let _ = std::fs::remove_dir_all(super::path(path));
 }
 
 /// The console input (`CONIN$`) becomes the standard input.
@@ -411,15 +482,15 @@ pub fn parent_is_init() -> bool {
     false
 }
 
-// W7 Task 6: detached children on Windows.
-pub fn detach(_cmd: &mut Command) {}
+/// No console and a process group of its own (Ctrl-C in nnn's console does not reach it).
+pub fn detach(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
 
 pub fn wait_status(st: ExitStatus) -> i32 {
     st.code().unwrap_or(-1)
 }
-
-// W7 Task 6: command output read without blocking on Windows.
-pub fn set_pipe_nonblocking(_r: &io::PipeReader, _w: &io::PipeWriter) {}
 
 // W7 Task 7: free and used space on Windows.
 pub fn fs_blocks(_path: &[u8]) -> Option<FsBlocks> {
@@ -458,14 +529,69 @@ impl DirWatch {
     }
 }
 
+/// The flags the console control handler sets: Ctrl-C's (`int`) and a close's (`term`).
+static CTRL_FLAGS: OnceLock<(Arc<AtomicBool>, Arc<AtomicBool>)> = OnceLock::new();
+/// The event the handler sets so `Term::read` stops waiting, as a signal ends `poll` on
+/// Unix (0 until `register_signals`).
+static WAKE: AtomicUsize = AtomicUsize::new(0);
+/// How long the handler keeps a closing console's process alive for nnn to leave curses and
+/// exit (Windows ends the process when the handler returns, and after 5 s in any case).
+const CLOSE_GRACE: Duration = Duration::from_secs(4);
+
+fn wake_handle() -> Option<HANDLE> {
+    let h = WAKE.load(Ordering::Acquire);
+    (h != 0).then_some(h as HANDLE)
+}
+
+/// The console's events as nnn's signals: Ctrl-C is SIGINT (sets `int`), Ctrl-Break is
+/// SIGQUIT (ignored), closing the console, logoff and shutdown are SIGHUP/SIGTERM (set
+/// `term`, then give the main loop time to exit cleanly). Each wakes `Term::read`.
+extern "system" fn console_ctrl(event: u32) -> BOOL {
+    let Some((int, term)) = CTRL_FLAGS.get() else {
+        return FALSE;
+    };
+    let (flag, closing) = match event {
+        CTRL_C_EVENT => (int, false),
+        CTRL_BREAK_EVENT => return TRUE,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => (term, true),
+        _ => return FALSE,
+    };
+    flag.store(true, Ordering::Relaxed);
+    if let Some(h) = wake_handle() {
+        // SAFETY: h is the event register_signals created; it is never closed.
+        unsafe { SetEvent(h) };
+    }
+    if closing {
+        std::thread::sleep(CLOSE_GRACE);
+    }
+    TRUE
+}
+
 pub fn register_signals(
     int: Arc<AtomicBool>,
     term: Arc<AtomicBool>,
 ) -> Result<(), (SignalStep, io::Error)> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
-    use signal_hook::flag::register;
-    register(SIGINT, int).map_err(|e| (SignalStep::Interrupt, e))?;
-    register(SIGTERM, term).map_err(|e| (SignalStep::Terminate, e))?;
+    if WAKE.load(Ordering::Acquire) == 0 {
+        // SAFETY: no attributes and no name; a manual-reset event, initially not set.
+        let h = unsafe { CreateEventW(std::ptr::null(), TRUE, FALSE, std::ptr::null()) };
+        if h.is_null() {
+            return Err((SignalStep::Interrupt, io::Error::last_os_error()));
+        }
+        WAKE.store(h as usize, Ordering::Release);
+    }
+    let _ = CTRL_FLAGS.set((int, term.clone()));
+    // SAFETY: a null handler with FALSE turns Ctrl-C handling back on (a parent may have
+    // started nnn ignoring it); console_ctrl only touches statics and lives for the process.
+    let ok = unsafe {
+        SetConsoleCtrlHandler(None, FALSE) != 0
+            && SetConsoleCtrlHandler(Some(console_ctrl), TRUE) != 0
+    };
+    if !ok {
+        return Err((SignalStep::Interrupt, io::Error::last_os_error()));
+    }
+    // raise(SIGTERM) still exits cleanly.
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, term)
+        .map_err(|e| (SignalStep::Terminate, e))?;
     Ok(())
 }
 
@@ -577,17 +703,28 @@ impl Term {
     }
 
     /// Waits up to `wait_ms` (-1: no limit) for keys; typed characters come as UTF-8 (VT input
-    /// sends keys as the escape sequences a terminal does).
+    /// sends keys as the escape sequences a terminal does). A console control event (Ctrl-C)
+    /// ends the wait as a signal ends `poll` on Unix.
     pub fn read(&mut self, wait_ms: i32, out: &mut Vec<u8>) -> ReadResult {
         let deadline = u64::try_from(wait_ms)
             .ok()
             .map(|ms| Instant::now() + Duration::from_millis(ms));
+        let wake = wake_handle();
+        if let Some(h) = wake {
+            // SAFETY: h is the event register_signals created; it is never closed.
+            unsafe { ResetEvent(h) };
+        }
+        let handles: Vec<HANDLE> = [Some(self.input), wake].into_iter().flatten().collect();
         loop {
             let wait = deadline.map_or(INFINITE, |d| {
                 d.saturating_duration_since(Instant::now()).as_millis() as u32
             });
-            // SAFETY: the input handle is valid for the life of the process.
-            if unsafe { WaitForSingleObject(self.input, wait) } != WAIT_OBJECT_0 {
+            // SAFETY: handles holds the console input and the wake event, both valid for the
+            // life of the process; the count is the vector's length.
+            let r = unsafe {
+                WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, wait)
+            };
+            if r != WAIT_OBJECT_0 {
                 return ReadResult::Timeout;
             }
             let mut recs = [INPUT_RECORD::default(); 64];
@@ -778,6 +915,47 @@ mod tests {
         let mut perms = std::fs::metadata(&f).unwrap().permissions();
         perms.set_readonly(false);
         std::fs::set_permissions(&f, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmd_arguments_keep_cmd_syntax() {
+        assert_eq!(&*cmd_arg(b"/C"), b"/C");
+        assert_eq!(&*cmd_arg(br#""""#), br#""""#);
+        assert_eq!(&*cmd_arg(b""), br#""""#);
+        assert_eq!(&*cmd_arg(b"C:/My Files/a.txt"), br#""C:/My Files/a.txt""#);
+        assert_eq!(&*cmd_arg(br#"notepad "a b""#), br#"notepad "a b""#);
+        let out = super::super::command(&[b"cmd".to_vec(), b"/C".to_vec(), b"echo a  b".to_vec()])
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, b"a  b\r\n");
+    }
+
+    #[test]
+    fn windows_defaults() {
+        let d = defaults();
+        assert_eq!(d.opener, br#"cmd /C start """#);
+        assert_eq!(
+            (&d.editor[..], &d.pager[..]),
+            (&b"notepad"[..], &b"more"[..])
+        );
+        assert!(!d.shell.is_empty());
+    }
+
+    #[test]
+    fn shell_prefix_prefers_sh() {
+        let dir = std::env::temp_dir().join(format!("nnn-sh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let git = dir.join("git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("sh.exe"), b"").unwrap();
+        let path = std::env::join_paths([&empty, &git]).unwrap();
+        assert_eq!(shell_exec_prefix_in(Some(&path)), b"sh -c");
+        assert_eq!(shell_exec_prefix_in(Some(empty.as_os_str())), b"cmd /C");
+        assert_eq!(shell_exec_prefix_in(None), b"cmd /C");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
