@@ -15,10 +15,10 @@ use crate::locale::setenv;
 use crate::popup::{F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, F_PAGE, F_WINDOW};
 use crate::prompt::{INVALID_POS, PROMPT};
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX};
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
 
 /// `messages[MSG_ENTER]`
@@ -40,8 +40,8 @@ const NNNLVL: &str = "NNNLVL";
 /// `TMP_LEN_MAX`
 const TMP_LEN_MAX: usize = 64;
 
-fn os(b: &[u8]) -> &OsStr {
-    OsStr::from_bytes(cstr(b))
+fn os(b: &[u8]) -> Cow<'_, OsStr> {
+    crate::platform::os(cstr(b))
 }
 
 /// `xitoa` of an unsigned value.
@@ -602,7 +602,7 @@ impl Nnn {
         }
 
         // Set nnn nesting level
-        let r = std::env::var_os(NNNLVL).map_or(0, |v| atoi(v.as_bytes()));
+        let r = std::env::var_os(NNNLVL).map_or(0, |v| atoi(&crate::platform::bytes(&v)));
 
         setenv(NNNLVL, &xitoa(r.wrapping_add(1) as u32));
         let shell = self.shell.clone();

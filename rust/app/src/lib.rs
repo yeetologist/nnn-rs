@@ -14,6 +14,7 @@ pub mod listmode;
 pub mod locale;
 pub mod mounts;
 pub mod opts;
+pub mod platform;
 pub mod plugin;
 pub mod popup;
 pub mod prompt;

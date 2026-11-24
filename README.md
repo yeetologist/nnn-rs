@@ -15,7 +15,7 @@ The Rust port of [nnn](https://github.com/jarun/nnn), the terminal file manager,
     rust-anything app replay . --build rust/app/target/debug/nnn          # 242/242
     python3 rust/bytes-check.py rust/app/target/debug/nnn                 # 246/246
     python3 rust/tui-cases/harness.py check $(pwd)/rust/app/target/debug/nnn   # 48/48 (tmux)
-    rust/oracle/run.sh rust/app/target/release/oracle                     # 15 "ok" (cargo build --release first)
+    rust/oracle/run.sh rust/app/target/release/oracle                     # 15 "ok" (cargo build --release --features oracles first)
 
 `rust-anything app replay .` (no `--build`) replays the recorded cases against the original.
 

@@ -1,11 +1,8 @@
 //! Archives (create, list, extract, mount) and remote mounts (src/nnn.c: get_archive_cmd,
 //! sel_paths_in_dir, archive_selection, handle_archive, archive_mount, remote_mount, unmount).
 
-use std::ffi::OsStr;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::browse::{MESSAGES, MSG_FAILED, xdiraccess};
@@ -43,10 +40,7 @@ const ARCHIVE_CMD: [&[u8]; 4] = [b"atool -a", b"bsdtar -acvf", b"zip -r", b"tar 
 /// The static `found` of `unmount`: "fusermount3" was not found, "fusermount" is used.
 static FUSERMOUNT_OLD: AtomicBool = AtomicBool::new(false);
 
-fn path(p: &[u8]) -> &Path {
-    Path::new(OsStr::from_bytes(p))
-}
-
+use crate::platform::path;
 /// `shell_escape` with a dynamic buffer (it cannot fail but for memory): `'...'` with each
 /// `'` written as `'\\''`.
 fn shell_escape(inbuf: &[u8]) -> Vec<u8> {
@@ -226,7 +220,7 @@ impl Nnn {
                 }
                 // Copy the new dir path to open it in smart context
                 match std::env::current_dir() {
-                    Ok(d) => outdir = d.as_os_str().as_bytes().to_vec(),
+                    Ok(d) => outdir = crate::platform::bytes(d.as_os_str()).to_vec(),
                     Err(_) => return false,
                 }
                 x_to = true;

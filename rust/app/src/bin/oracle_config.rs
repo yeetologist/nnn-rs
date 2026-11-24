@@ -30,11 +30,10 @@ fn rooted(root: &[u8], rel: &[u8]) -> Vec<u8> {
 }
 
 fn putfile(p: &[u8]) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    match std::fs::read(std::ffi::OsStr::from_bytes(p)) {
+    match std::fs::read(&*nnn::platform::os(p)) {
         Ok(b) => hex(&b[..b.len().min(1 << 14)]),
         // open(2) of a directory succeeds and its read(2) fails, as the C side prints.
-        Err(_) if std::fs::File::open(std::ffi::OsStr::from_bytes(p)).is_ok() => "-".to_string(),
+        Err(_) if std::fs::File::open(&*nnn::platform::os(p)).is_ok() => "-".to_string(),
         Err(_) => "nofile".to_string(),
     }
 }
@@ -115,8 +114,8 @@ fn call(f: &[&str], root: &[u8]) -> String {
 }
 
 fn main() {
-    use std::os::unix::ffi::OsStringExt;
-    let root = std::env::var_os("ORACLE_ROOT").map_or_else(|| b".".to_vec(), OsStringExt::into_vec);
+    let root =
+        std::env::var_os("ORACLE_ROOT").map_or_else(|| b".".to_vec(), nnn::platform::into_bytes);
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {

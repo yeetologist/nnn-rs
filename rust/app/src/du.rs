@@ -12,8 +12,7 @@ use crate::sort::Entry;
 use crate::state::Nnn;
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
-use std::ffi::{CStr, OsStr};
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -242,7 +241,8 @@ fn du_walk_dir(
     tfiles: &mut u64,
     tblocks: &mut i64,
 ) {
-    let Ok(sb_root) = rustix::fs::statat(CWD, OsStr::from_bytes(root), AtFlags::SYMLINK_NOFOLLOW)
+    let Ok(sb_root) =
+        rustix::fs::statat(CWD, &*crate::platform::os(root), AtFlags::SYMLINK_NOFOLLOW)
     else {
         return;
     };
@@ -255,7 +255,7 @@ fn du_walk_dir(
         *tfiles += 1;
     }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let Ok(fd) = rustix::fs::open(OsStr::from_bytes(root), flags, Mode::empty()) else {
+    let Ok(fd) = rustix::fs::open(&*crate::platform::os(root), flags, Mode::empty()) else {
         return;
     };
     let Ok(dir) = Dir::read_from(&fd) else {
@@ -521,7 +521,8 @@ impl DuHook for DuFill<'_> {
         n.du.first_call = true;
         n.num_files = 0;
         n.dir_blocks = 0;
-        let Ok(sb_path) = rustix::fs::statat(fd, OsStr::from_bytes(path), AtFlags::empty()) else {
+        let Ok(sb_path) = rustix::fs::statat(fd, &*crate::platform::os(path), AtFlags::empty())
+        else {
             return false;
         };
         self.path_dev = sb_path.st_dev;

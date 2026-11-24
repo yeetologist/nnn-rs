@@ -78,7 +78,7 @@ impl Default for CoreState {
 
 /// `istopdir`
 pub fn istopdir(path: &[u8]) -> bool {
-    path == b"/"
+    crate::platform::is_root(path)
 }
 
 /// The bytes of a C string held in a buffer: up to the first NUL.
@@ -871,10 +871,7 @@ impl Nnn {
             }
             if pent.mode & S_IFMT == S_IFLNK {
                 if !self.cfg.fileinfo {
-                    let link = rustix::fs::readlink(
-                        std::ffi::OsStr::from_bytes_compat(&pent.name),
-                        Vec::new(),
-                    );
+                    let link = rustix::fs::readlink(&*crate::platform::os(&pent.name), Vec::new());
                     let (i, target) = match link {
                         Ok(t) => {
                             let b = t.into_bytes();
@@ -897,7 +894,7 @@ impl Nnn {
                 w.addch(' ');
                 w.addstr(&ext);
                 if pent.flags & HARD_LINK != 0
-                    && let Ok(sb) = rustix::fs::stat(std::ffi::OsStr::from_bytes_compat(&pent.name))
+                    && let Ok(sb) = rustix::fs::stat(&*crate::platform::os(&pent.name))
                 {
                     let s = format!(" {}-{}", sb.st_nlink as i32 as u32, sb.st_ino as i32 as u32);
                     let mut parts = s.splitn(2, '-');
@@ -1435,7 +1432,7 @@ impl Nnn {
             return None;
         }
         let dir = crate::config::xdirname(path);
-        if std::env::set_current_dir(std::ffi::OsStr::from_bytes_compat(&dir)).is_err() {
+        if std::env::set_current_dir(&*crate::platform::os(&dir)).is_err() {
             self.printwarn(presel);
             return None;
         }
@@ -1493,16 +1490,4 @@ pub fn wcstombs_n(w: &[i32], n: usize) -> Vec<u8> {
         out.extend_from_slice(&b);
     }
     out
-}
-
-/// `OsStr::from_bytes` for byte paths.
-trait FromBytesCompat {
-    fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr;
-}
-
-impl FromBytesCompat for std::ffi::OsStr {
-    fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr {
-        use std::os::unix::ffi::OsStrExt;
-        std::ffi::OsStr::from_bytes(b)
-    }
 }

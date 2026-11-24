@@ -4,7 +4,6 @@
 //!   oracle_listmode <tmp-dir> [<cwd-for-relative-paths>]
 
 use nnn::state::Nnn;
-use std::os::unix::ffi::OsStringExt;
 use std::process::ExitCode;
 
 fn put(key: &str, v: Option<&[u8]>) {
@@ -20,7 +19,7 @@ fn put(key: &str, v: Option<&[u8]>) {
 fn main() -> ExitCode {
     let args: Vec<Vec<u8>> = std::env::args_os()
         .skip(1)
-        .map(OsStringExt::into_vec)
+        .map(nnn::platform::into_bytes)
         .collect();
     let Some(tmp) = args.first() else {
         return ExitCode::from(2);

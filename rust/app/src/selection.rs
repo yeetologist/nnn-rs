@@ -12,12 +12,9 @@ use crate::sort::{FILE_SCANNED, FILE_SELECTED};
 use crate::state::{NAME_MAX, Nnn, PATH_MAX};
 use crate::sys;
 use std::cmp::Ordering;
-use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 
 const MSG_0_SELECTED: &[u8] = b"0 selected";
 const MSG_CUR_SEL_OPTS: &[u8] = b"'c'urrent/'s'el?";
@@ -26,10 +23,7 @@ const MSG_RM_TMP: &[u8] = b"remove tmp file?";
 /// `utils[UTIL_SH_EXEC]`.
 const UTIL_SH_EXEC: &[u8] = b"sh -c";
 
-fn path(p: &[u8]) -> &Path {
-    Path::new(OsStr::from_bytes(p))
-}
-
+use crate::platform::path;
 /// One write(2), true when all of `buf` went out (as `write(fd, buf, n) == n`).
 fn write_once(f: &mut dyn Write, buf: &[u8]) -> bool {
     matches!(f.write(buf), Ok(n) if n == buf.len())
@@ -527,7 +521,7 @@ impl Nnn {
 
         // Fail if selection file path isn't accessible
         if let Err(e) = rustix::fs::access(
-            path(&selpath),
+            &*path(&selpath),
             rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
         ) {
             if e == rustix::io::Errno::NOENT {

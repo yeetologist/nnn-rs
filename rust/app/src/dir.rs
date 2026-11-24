@@ -6,8 +6,7 @@ use crate::sort::{
 };
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
-use std::ffi::{CStr, OsStr};
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::CStr;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFLNK: u32 = 0o120000;
@@ -105,7 +104,7 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let Ok(fd) = rustix::fs::open(OsStr::from_bytes(path), flags, Mode::empty()) else {
+    let Ok(fd) = rustix::fs::open(&*crate::platform::os(path), flags, Mode::empty()) else {
         return Vec::new();
     };
     let Ok(dir) = Dir::read_from(&fd) else {

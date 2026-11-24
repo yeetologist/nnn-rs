@@ -10,12 +10,9 @@ use crate::config::{CMD_LEN_MAX, cstr};
 use crate::keys::Action;
 use crate::popup::{F_CHKRTN, F_CLI};
 use crate::state::{NAME_MAX, Nnn, PATH_MAX};
-use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 
 // messages[] indexes this module uses.
 const MSG_0_SELECTED: usize = 3;
@@ -33,10 +30,7 @@ const MV: &[u8] = b"mv -i --";
 const PROGRESS_CP: &[u8] = b"cpg -giRp --";
 const PROGRESS_MV: &[u8] = b"mvg -gi --";
 
-fn path(p: &[u8]) -> &Path {
-    Path::new(OsStr::from_bytes(p))
-}
-
+use crate::platform::path;
 /// `snprintf(buf, CMD_LEN_MAX, ...)`: the text cut to what fits with its NUL.
 fn cmdbuf(mut v: Vec<u8>) -> Vec<u8> {
     v.truncate(CMD_LEN_MAX - 1);

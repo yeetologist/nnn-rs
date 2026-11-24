@@ -1,14 +1,9 @@
 //! Thin wrappers over the system calls the original makes, with its error output.
 
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 
-fn path(p: &[u8]) -> &Path {
-    Path::new(std::ffi::OsStr::from_bytes(p))
-}
-
+use crate::platform::{self, path};
 /// `strerror(errno)`: Rust's message without its " (os error N)" suffix.
 pub fn strerror(e: &io::Error) -> String {
     let s = e.to_string();
@@ -47,21 +42,31 @@ pub fn dir_access(p: &[u8]) -> bool {
 pub fn abspath_in(p: &[u8], cwd: Option<&[u8]>, home: Option<&[u8]>) -> Option<Vec<u8>> {
     let (base, rel): (Option<Vec<u8>>, &[u8]) = if p.starts_with(b"~/") {
         (home.map(<[u8]>::to_vec), &p[2..])
-    } else if p.first() != Some(&b'/') && cwd.is_none() {
+    } else if !platform::is_absolute(p) && cwd.is_none() {
         let wd = std::env::current_dir().ok()?;
-        (Some(wd.as_os_str().as_bytes().to_vec()), p)
+        (Some(platform::bytes(wd.as_os_str()).to_vec()), p)
     } else {
         (cwd.map(<[u8]>::to_vec), p)
     };
-    let mut out = if rel.first() != Some(&b'/') {
-        base?
+    // The root (`/`, `C:/`, `//server/share/`) of the result: never cut by `..`.
+    let (mut out, rel, root) = if platform::is_absolute(rel) {
+        let n = platform::root_len(rel);
+        let root = rel[..n].to_vec();
+        let kept = root.strip_suffix(b"/").unwrap_or(&root).to_vec();
+        (kept, &rel[n..], root)
+    } else if rel.first() == Some(&b'/') {
+        (Vec::new(), rel, Vec::new())
     } else {
-        Vec::new()
+        let base = base?;
+        let root = base[..platform::root_len(&base)].to_vec();
+        (base, rel, root)
     };
     for part in rel.split(|&c| c == b'/') {
         match part {
             b".." => {
-                if let Some(at) = out.iter().rposition(|&c| c == b'/') {
+                if let Some(at) = out.iter().rposition(|&c| c == b'/')
+                    && at + 1 >= root.len()
+                {
                     out.truncate(at);
                 }
             }
@@ -71,6 +76,9 @@ pub fn abspath_in(p: &[u8], cwd: Option<&[u8]>, home: Option<&[u8]>) -> Option<V
                 out.extend_from_slice(part);
             }
         }
+    }
+    if out.len() < root.len() {
+        out = root;
     }
     if out.is_empty() {
         out.push(b'/');

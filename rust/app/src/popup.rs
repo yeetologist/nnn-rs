@@ -20,11 +20,11 @@ use crate::fmt;
 use crate::keys::Action;
 use crate::state::{Kv, Nnn, PATH_MAX};
 use crate::sys;
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
@@ -158,8 +158,8 @@ fn cstr(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
 
-fn os(b: &[u8]) -> &OsStr {
-    OsStr::from_bytes(cstr(b))
+fn os(b: &[u8]) -> Cow<'_, OsStr> {
+    crate::platform::os(cstr(b))
 }
 
 /// `ISBLANK`
@@ -233,7 +233,7 @@ pub fn parseargs(cmd: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// `xgetenv`: the variable's value when set and not empty, else `fallback`.
 pub fn xgetenv(name: &str, fallback: Option<&[u8]>) -> Option<Vec<u8>> {
     match std::env::var_os(name) {
-        Some(v) if !v.is_empty() => Some(v.as_bytes().to_vec()),
+        Some(v) if !v.is_empty() => Some(crate::platform::into_bytes(v)),
         _ => fallback.map(<[u8]>::to_vec),
     }
 }
@@ -1104,7 +1104,7 @@ impl Nnn {
             if let Some(s) = std::env::var_os(name) {
                 f.extend_from_slice(name.as_bytes());
                 f.extend_from_slice(b": ");
-                f.extend_from_slice(s.as_bytes());
+                f.extend_from_slice(&crate::platform::bytes(&s));
                 f.push(b'\n');
             }
         }

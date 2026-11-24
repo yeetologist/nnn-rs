@@ -9,10 +9,59 @@ description = "nnn, the terminal file manager, ported from C to Rust (rust/DECIS
 name = "nnn"
 path = "src/main.rs"
 
+[[bin]]
+name = "oracle"
+path = "src/bin/oracle.rs"
+required-features = ["oracles"]
+
+[[bin]]
+name = "oracle_browse"
+path = "src/bin/oracle_browse.rs"
+required-features = ["oracles"]
+
+[[bin]]
+name = "oracle_config"
+path = "src/bin/oracle_config.rs"
+required-features = ["oracles"]
+
+[[bin]]
+name = "oracle_fileops"
+path = "src/bin/oracle_fileops.rs"
+required-features = ["oracles"]
+
+[[bin]]
+name = "oracle_listmode"
+path = "src/bin/oracle_listmode.rs"
+required-features = ["oracles"]
+
+[[bin]]
+name = "oracle_popup"
+path = "src/bin/oracle_popup.rs"
+required-features = ["oracles"]
+
+[[bin]]
+name = "oracle_prompt"
+path = "src/bin/oracle_prompt.rs"
+required-features = ["oracles"]
+
+[[bin]]
+name = "oracle_session"
+path = "src/bin/oracle_session.rs"
+required-features = ["oracles"]
+
+[features]
+# The oracle binaries compare modules with the C original (rust/oracle); build them with --features oracles.
+oracles = []
+
 [dependencies]
+signal-hook = "0.4.6"
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 rustix = { version = "1.1.6", features = ["event", "fs", "process", "stdio", "termios"] }
-signal-hook = "0.4.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
 
 [workspace]
 

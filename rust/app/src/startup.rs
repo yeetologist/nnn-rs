@@ -4,7 +4,6 @@ use crate::opts::{self, Opts};
 use crate::sys;
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::ffi::OsStringExt;
 
 /// The `cleanup()` the original registers with `atexit` once the temp path is known.
 fn cleanup(st: &Opts) {
@@ -17,11 +16,11 @@ fn cleanup(st: &Opts) {
 
 /// `main()`: the exit code.
 pub fn run(argv: Vec<OsString>) -> u8 {
-    let argv: Vec<Vec<u8>> = argv.into_iter().map(OsStringExt::into_vec).collect();
+    let argv: Vec<Vec<u8>> = argv.into_iter().map(crate::platform::into_bytes).collect();
     let mut st = Opts::default();
 
     if let Some(env) = std::env::var_os("NNN_OPTS")
-        && let Some(code) = opts::parse_env_opts(&env.into_vec(), &mut st)
+        && let Some(code) = opts::parse_env_opts(&crate::platform::into_bytes(env), &mut st)
     {
         return code;
     }
@@ -57,7 +56,7 @@ fn rust_tui(st: Opts, operands: &[Vec<u8>]) -> u8 {
         b"/tmp".to_vec()
     } else {
         std::env::var_os("TMPDIR")
-            .map(OsStringExt::into_vec)
+            .map(crate::platform::into_bytes)
             .unwrap_or_default()
     };
     if !nnn.list_mode_main() {

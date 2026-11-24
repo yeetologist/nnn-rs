@@ -8,11 +8,8 @@ use crate::state::{Nnn, PATH_MAX};
 use crate::sys;
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{Access, Mode, OFlags};
-use std::ffi::OsStr;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::Path;
 use std::time::Duration;
 
 /// \`LIST_FILES_MAX\`: list mode shows at most 16K files.
@@ -39,10 +36,7 @@ pub const MSG_SIZE_LIMIT: &[u8] = b"size limit exceeded";
 #[derive(Debug, Default)]
 pub struct ListState {}
 
-fn path(p: &[u8]) -> &Path {
-    Path::new(OsStr::from_bytes(p))
-}
-
+use crate::platform::path;
 /// \`xmemrchr\`: index of the last \`ch\` in \`s\`.
 fn xmemrchr(s: &[u8], ch: u8) -> Option<usize> {
     s.iter().rposition(|&c| c == ch)
@@ -50,9 +44,10 @@ fn xmemrchr(s: &[u8], ch: u8) -> Option<usize> {
 
 /// \`xdirname\` on an absolute path: the directory part ("/" for a top-level entry).
 fn xdirname(p: &[u8]) -> &[u8] {
-    match xmemrchr(p, b'/') {
-        Some(0) | None => b"/",
-        Some(at) => &p[..at],
+    if p.contains(&b'/') {
+        crate::platform::xdirname(p)
+    } else {
+        b"/"
     }
 }
 
@@ -89,16 +84,17 @@ fn common_prefix(path: &[u8], prefix: &mut Vec<u8>) -> bool {
     }
     // Shorten prefix
     prefix.truncate(n);
+    let root = crate::platform::root_len(path).max(1);
     match xmemrchr(prefix, b'/') {
-        Some(0) | None => prefix.truncate(1), // Just '/'
-        Some(sep) => prefix.truncate(sep),
+        Some(sep) => prefix.truncate(sep.max(root)),
+        None => prefix.truncate(root), // Just the root
     }
     true
 }
 
 /// \`xmktree(path, TRUE, TRUE)\`: \`mkdir -p\` with mode 0777 (umask applies).
 fn xmktree(p: &[u8]) -> bool {
-    let mkdir = |d: &[u8]| match rustix::fs::mkdir(path(d), Mode::from_raw_mode(0o777)) {
+    let mkdir = |d: &[u8]| match rustix::fs::mkdir(&*path(d), Mode::from_raw_mode(0o777)) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => true,
         Err(_) => false,
     };
@@ -134,7 +130,7 @@ fn mkdtemp(template: &mut [u8]) -> bool {
             *c = LETTERS[(v % 62) as usize];
             v /= 62;
         }
-        match rustix::fs::mkdir(path(template), Mode::from_raw_mode(0o700)) {
+        match rustix::fs::mkdir(&*path(template), Mode::from_raw_mode(0o700)) {
             Ok(()) => return true,
             Err(rustix::io::Errno::EXIST) => {}
             Err(_) => return false,
@@ -171,7 +167,7 @@ impl Nnn {
             // spawn(utils[UTIL_RM_RF], listpath, NULL, NULL, F_NOTRACE | F_MULTI)
             let _ = std::process::Command::new(UTIL_RM_RF[0])
                 .arg(UTIL_RM_RF[1])
-                .arg(OsStr::from_bytes(&lp))
+                .arg(&*crate::platform::os(&lp))
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
@@ -197,7 +193,7 @@ impl Nnn {
         self.listpath = Some(tmpdir.clone());
 
         for p in paths.iter().flatten() {
-            if let Err(rustix::io::Errno::NOENT) = rustix::fs::stat(path(p)) {
+            if let Err(rustix::io::Errno::NOENT) = rustix::fs::stat(&*path(p)) {
                 continue;
             }
 
@@ -208,7 +204,7 @@ impl Nnn {
             // Get the dir containing the path
             let dir_end = xmemrchr(&tmpdir[tmp..], b'/').map_or(tmpdir.len(), |s| tmp + s);
             let dir = &tmpdir[..dir_end];
-            if rustix::fs::access(path(dir), Access::EXISTS).is_err() {
+            if rustix::fs::access(&*path(dir), Access::EXISTS).is_err() {
                 // Create directory if it doesn't exist
                 xmktree(dir);
             }
@@ -236,7 +232,7 @@ impl Nnn {
 
         let cwd: Vec<u8> = match cwd {
             None => match std::env::current_dir() {
-                Ok(d) => d.into_os_string().into_vec(),
+                Ok(d) => crate::platform::into_bytes(d.into_os_string()),
                 Err(_) => return None,
             },
             Some(p) => p[..p.len().min(PATH_MAX - 1)].to_vec(),
@@ -411,9 +407,9 @@ mod tests {
         std::fs::create_dir_all(fx.join("d/e")).unwrap();
         std::fs::write(fx.join("d/e/f"), b"").unwrap();
         std::fs::write(fx.join("d/g"), b"").unwrap();
-        let fxb = fx.as_os_str().as_bytes().to_vec();
+        let fxb = crate::platform::bytes(fx.as_os_str()).to_vec();
         let mut n = Nnn {
-            g_tmpfpath: base.as_os_str().as_bytes().to_vec(),
+            g_tmpfpath: crate::platform::bytes(base.as_os_str()).to_vec(),
             ..Nnn::default()
         };
         let (r, mut w) = std::io::pipe().unwrap();
@@ -424,7 +420,7 @@ mod tests {
         assert_eq!(n.listpath.as_deref(), Some(root.as_slice()));
         // "missing/x" still counts towards the common directory.
         assert_eq!(n.listroot.as_deref(), Some(fxb.as_slice()));
-        let root = std::path::PathBuf::from(OsStr::from_bytes(&root));
+        let root = std::path::PathBuf::from(&*crate::platform::os(&root));
         assert_eq!(
             std::fs::read_link(root.join("d/g")).unwrap(),
             fx.join("d/g")

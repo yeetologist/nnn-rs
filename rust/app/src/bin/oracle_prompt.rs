@@ -3,7 +3,6 @@
 
 use nnn::prompt::{INVALID_POS, PromptState, xconfirm};
 use std::io::{BufRead, Write};
-use std::os::unix::ffi::OsStrExt;
 
 fn unhex(h: &str) -> Vec<u8> {
     h.as_bytes()
@@ -53,10 +52,10 @@ fn main() {
                 let _ = out.flush();
                 s.clear();
                 p.xwrite_history(cstr(&arg));
-                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(cstr(&arg)));
+                let path = nnn::platform::path(cstr(&arg));
                 s += &format!(
                     " {}",
-                    std::fs::read(path).map_or("-".to_string(), |b| hex(&b))
+                    std::fs::read(&path).map_or("-".to_string(), |b| hex(&b))
                 );
             }
             'C' => {

@@ -195,7 +195,7 @@ pub fn is_walnum(c: i32) -> bool {
 
 /// `setenv(name, value, 1)`: variables nnn exports to the programs it starts.
 pub fn setenv(name: &str, value: &[u8]) {
-    let v = std::ffi::OsStr::from_bytes_compat(value);
+    let v = &*crate::platform::os(value);
     // SAFETY: nnn sets these from its main thread at points where no other thread reads or
     // writes the environment (the du workers never touch it), as the C original does.
     unsafe { std::env::set_var(name, v) };
@@ -205,15 +205,4 @@ pub fn setenv(name: &str, value: &[u8]) {
 pub fn unsetenv(name: &str) {
     // SAFETY: as for setenv.
     unsafe { std::env::remove_var(name) };
-}
-
-trait FromBytesCompat {
-    fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr;
-}
-
-impl FromBytesCompat for std::ffi::OsStr {
-    fn from_bytes_compat(b: &[u8]) -> &std::ffi::OsStr {
-        use std::os::unix::ffi::OsStrExt;
-        std::ffi::OsStr::from_bytes(b)
-    }
 }

@@ -4,12 +4,9 @@
 
 use crate::state::{Kv, Nnn, PATH_MAX};
 use crate::sys;
-use std::ffi::OsStr;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::Path;
 
 /// `CMD_LEN_MAX`: the size of `g_buf`.
 pub const CMD_LEN_MAX: usize = PATH_MAX + ((crate::state::NAME_MAX + 1) << 1);
@@ -38,10 +35,7 @@ const MSG_BM_NAME: &[u8] = b"name: ";
 /// The maximum number of key-value pairs parsekvpair reads.
 const KV_MAX: usize = 100;
 
-fn path(p: &[u8]) -> &Path {
-    Path::new(OsStr::from_bytes(p))
-}
-
+use crate::platform::path;
 /// The C string in `s`: the bytes before the first NUL.
 pub fn cstr(s: &[u8]) -> &[u8] {
     s.iter().position(|&c| c == 0).map_or(s, |at| &s[..at])
@@ -116,11 +110,7 @@ fn xmemrchr(s: &[u8], ch: u8, n: usize) -> Option<usize> {
 /// '/'; this returns such a path unchanged.
 pub fn xdirname(p: &[u8]) -> Vec<u8> {
     let p = cstr(p);
-    match xmemrchr(p, b'/', p.len()) {
-        Some(0) => p[..1].to_vec(),
-        Some(at) => p[..at].to_vec(),
-        None => p.to_vec(),
-    }
+    crate::platform::xdirname(p).to_vec()
 }
 
 /// `xbasename`.
@@ -144,7 +134,7 @@ pub fn tilde_is_home_strict(s: &[u8]) -> bool {
 
 /// `istopdir`.
 pub fn istopdir(p: &[u8]) -> bool {
-    cstr(p) == b"/"
+    crate::platform::is_root(cstr(p))
 }
 
 /// `convert_tilde`: `~` or `~/...` with `home` put in place of the `~`.
@@ -215,9 +205,9 @@ pub fn common_prefix(p: &[u8], prefix: &mut Vec<u8>) -> bool {
     }
     let mut pre = pre;
     pre.truncate(i);
+    let root = crate::platform::root_len(p);
     match xmemrchr(&pre, b'/', i) {
-        Some(0) => pre.truncate(1),
-        Some(at) => pre.truncate(at),
+        Some(at) => pre.truncate(at.max(root)),
         None => pre.clear(),
     }
     *prefix = pre;
@@ -227,7 +217,7 @@ pub fn common_prefix(p: &[u8], prefix: &mut Vec<u8>) -> bool {
 /// `bmtarget`: the absolute path of the link `filepath` points to, taking `cwd` into account.
 pub fn bmtarget(filepath: &[u8], cwd: &[u8], home: &[u8]) -> Option<Vec<u8>> {
     let target = std::fs::read_link(path(filepath)).ok()?;
-    let target = target.as_os_str().as_bytes();
+    let target = crate::platform::bytes(target.as_os_str());
     let target = &target[..target.len().min(PATH_MAX)];
     sys::abspath_in(cstr(target), Some(cwd), Some(home))
 }
@@ -426,7 +416,7 @@ impl Nnn {
     pub fn lazy_parse_plug(&mut self) -> bool {
         if !self.g_state.plugparsed {
             self.g_state.plugparsed = true;
-            let env = std::env::var_os("NNN_PLUG").map(|v| v.as_bytes().to_vec());
+            let env = std::env::var_os("NNN_PLUG").map(crate::platform::into_bytes);
             let (ok, plug) = parsekvpair(env.as_deref());
             self.plug = plug;
             if !ok {
@@ -516,7 +506,7 @@ impl Nnn {
     /// `setup_config`: the config directory and its subdirectories, the plugin directory and
     /// the selection file path. Errors are printed with the original's line numbers.
     pub fn setup_config(&mut self) -> bool {
-        let xdgcfg = std::env::var_os("XDG_CONFIG_HOME").map(|v| v.as_bytes().to_vec());
+        let xdgcfg = std::env::var_os("XDG_CONFIG_HOME").map(crate::platform::into_bytes);
         let mut xdg = None;
 
         // Set up configuration file paths
@@ -571,7 +561,7 @@ impl Nnn {
         // Set selection file path
         if !self.g_state.picker {
             let env_sel = std::env::var_os("NNN_SEL")
-                .map(|v| v.as_bytes().to_vec())
+                .map(crate::platform::into_bytes)
                 .filter(|v| !v.is_empty());
             self.selpath = Some(env_sel.unwrap_or_else(|| {
                 let mut s = self.cfgpath.clone();

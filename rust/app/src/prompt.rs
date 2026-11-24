@@ -7,7 +7,6 @@ use crate::locale;
 use crate::state::{NAME_MAX, Nnn, PATH_MAX};
 use crate::sys;
 use std::io::{self, BufRead, Write};
-use std::os::unix::ffi::OsStrExt;
 
 /// `MAX_HISTORY`: commands kept in the prompt history.
 pub const MAX_HISTORY: usize = 0x10;
@@ -180,7 +179,7 @@ impl PromptState {
     /// Ports `xread_history`: up to `MAX_HISTORY` lines of the file, each added as a
     /// command; a file that cannot be opened is ignored.
     pub fn xread_history(&mut self, histpath: &[u8]) {
-        let Ok(f) = std::fs::File::open(std::ffi::OsStr::from_bytes(histpath)) else {
+        let Ok(f) = std::fs::File::open(&*crate::platform::os(histpath)) else {
             return;
         };
         let mut r = io::BufReader::new(f);
@@ -203,7 +202,7 @@ impl PromptState {
         if self.cmd_hist.is_empty() {
             return;
         }
-        match std::fs::File::create(std::ffi::OsStr::from_bytes(histpath)) {
+        match std::fs::File::create(&*crate::platform::os(histpath)) {
             Ok(f) => {
                 let mut w = io::BufWriter::new(f);
                 for c in &self.cmd_hist {
@@ -746,7 +745,7 @@ mod tests {
     #[test]
     fn history_file_round_trip() {
         let f = tmp("rt");
-        let path = f.as_os_str().as_bytes().to_vec();
+        let path = crate::platform::bytes(f.as_os_str()).to_vec();
         let p = hist(&["ls -l", "", "echo 'x y'", "caf\u{e9}"]);
         p.xwrite_history(&path);
         assert_eq!(
@@ -762,7 +761,7 @@ mod tests {
     #[test]
     fn read_history_takes_16_lines_and_last_without_newline() {
         let f = tmp("16");
-        let path = f.as_os_str().as_bytes().to_vec();
+        let path = crate::platform::bytes(f.as_os_str()).to_vec();
         let mut body = Vec::new();
         for i in 0..20 {
             body.extend_from_slice(format!("l{i}\n").as_bytes());
@@ -783,7 +782,7 @@ mod tests {
     #[test]
     fn missing_history_file_is_ignored_and_empty_not_written() {
         let f = tmp("none");
-        let path = f.as_os_str().as_bytes().to_vec();
+        let path = crate::platform::bytes(f.as_os_str()).to_vec();
         let mut p = PromptState::default();
         p.xread_history(&path);
         assert!(p.cmd_hist.is_empty());

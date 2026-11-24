@@ -10,7 +10,6 @@ use crate::prompt::XDELAY_INTERVAL_MS;
 use crate::sort::TimeType;
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX, REGEX_MAX, Settings};
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 
 /// \`SESSIONS_VERSION\`
@@ -193,7 +192,7 @@ impl Nnn {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(std::ffi::OsStr::from_bytes(&spath));
+            .open(&*crate::platform::os(&spath));
         let Ok(mut f) = f else {
             self.printwait(MESSAGES[MSG_SEL_MISSING], presel);
             return;
@@ -233,7 +232,7 @@ impl Nnn {
             self.save_session(b"@", None);
         }
 
-        let Ok(mut f) = std::fs::File::open(std::ffi::OsStr::from_bytes(&spath)) else {
+        let Ok(mut f) = std::fs::File::open(&*crate::platform::os(&spath)) else {
             if !picker_ssn {
                 self.printmsg(MESSAGES[MSG_SEL_MISSING]);
                 self.xdelay(XDELAY_INTERVAL_MS);

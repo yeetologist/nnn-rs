@@ -26,12 +26,9 @@ use crate::prompt::xconfirm;
 use crate::sort::{DIR_OR_DIRLNK, Entry, FILE_SELECTED, TimeType};
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX};
 use crate::sys;
-use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -256,9 +253,7 @@ struct Locals {
     clock: Instant,
 }
 
-fn os(p: &[u8]) -> &Path {
-    Path::new(OsStr::from_bytes(p))
-}
+use crate::platform::path as os;
 
 /// `chdir() == 0`
 fn chdir(p: &[u8]) -> bool {
@@ -490,7 +485,7 @@ pub fn parse_fcolors(f_colors: &[u8], fcolors: &mut [u32]) -> bool {
 fn make_fifo(fp: &[u8]) -> Result<(), u8> {
     if let Err(e) = rustix::fs::mknodat(
         rustix::fs::CWD,
-        os(fp),
+        &*os(fp),
         rustix::fs::FileType::Fifo,
         rustix::fs::Mode::from_raw_mode(0o600),
         0,
@@ -510,7 +505,7 @@ fn make_fifo(fp: &[u8]) -> Result<(), u8> {
         }
         Ok(_) => {}
     }
-    if let Err(e) = rustix::fs::access(os(fp), rustix::fs::Access::WRITE_OK) {
+    if let Err(e) = rustix::fs::access(&*os(fp), rustix::fs::Access::WRITE_OK) {
         sys::xerror(10923, &e.into());
         return Err(1);
     }
@@ -1090,7 +1085,7 @@ impl Nnn {
         if let Some(fd) = &self.browse.inotify_fd {
             self.browse.inotify_wd = rustix::fs::inotify::add_watch(
                 fd,
-                os(path),
+                &*os(path),
                 rustix::fs::inotify::WatchFlags::from_bits_retain(INOTIFY_MASK),
             )
             .ok();
@@ -1246,7 +1241,7 @@ impl Nnn {
             self.browse.previewer = Some(mkpath(&self.plgpath, UTIL_NPREVIEW, &self.home).0);
         }
         if let Some(previewer) = self.browse.previewer.clone()
-            && rustix::fs::access(os(&previewer), rustix::fs::Access::EXEC_OK).is_ok()
+            && rustix::fs::access(&*os(&previewer), rustix::fs::Access::EXEC_OK).is_ok()
         {
             // spawn_redirected(): stdout and stderr into a pipe.
             let Ok((reader, writer)) = std::io::pipe() else {
@@ -1255,8 +1250,8 @@ impl Nnn {
             let Ok(werr) = writer.try_clone() else {
                 return;
             };
-            let child = std::process::Command::new(OsStr::from_bytes(&previewer))
-                .arg(OsStr::from_bytes(&fpath))
+            let child = std::process::Command::new(&*crate::platform::os(&previewer))
+                .arg(&*crate::platform::os(&fpath))
                 .arg(previewwidth.to_string())
                 .arg((xlines - 2).to_string())
                 .stdout(writer)
@@ -2877,7 +2872,7 @@ impl Nnn {
     /// `plugscript`: run a plugin of the plugin dir if it is executable.
     pub fn plugscript(&mut self, plugin: &[u8], flags: u16) -> bool {
         let (p, _) = mkpath(&self.plgpath, plugin, &self.home);
-        if rustix::fs::access(os(&p), rustix::fs::Access::EXEC_OK).is_ok() {
+        if rustix::fs::access(&*os(&p), rustix::fs::Access::EXEC_OK).is_ok() {
             self.spawn(&p, None, None, None, flags);
             return true;
         }
