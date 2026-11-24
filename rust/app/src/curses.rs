@@ -835,49 +835,60 @@ impl Curses {
         if let Some(c) = self.ungot.pop() {
             return Some(Input::Key(c));
         }
-        if self.take_resize() {
-            self.resize();
-            return Some(Input::Key(KEY_RESIZE));
-        }
-        if self.pending.is_empty() && !self.fill(self.timeout_ms) {
+        loop {
             if self.take_resize() {
                 self.resize();
                 return Some(Input::Key(KEY_RESIZE));
             }
-            return None;
-        }
-        if self.pending.first() == Some(&0x1b) {
-            let deadline = Instant::now() + Duration::from_millis(self.escdelay_ms);
-            loop {
-                match decode_escape(&self.pending) {
-                    Decoded::Key(k, n) => {
-                        let seq: Vec<u8> = self.pending.drain(..n).collect();
-                        if k == Input::Key(KEY_MOUSE) {
-                            self.last_mouse = parse_mouse(&seq).unwrap_or_default();
+            if self.pending.is_empty() && !self.fill(self.timeout_ms) {
+                if self.take_resize() {
+                    self.resize();
+                    return Some(Input::Key(KEY_RESIZE));
+                }
+                return None;
+            }
+            if self.pending.first() == Some(&0x1b) {
+                let deadline = Instant::now() + Duration::from_millis(self.escdelay_ms);
+                let mut ignored = false;
+                loop {
+                    match decode_escape(&self.pending) {
+                        Decoded::Key(k, n) => {
+                            let seq: Vec<u8> = self.pending.drain(..n).collect();
+                            if k == Input::Key(KEY_MOUSE) {
+                                self.last_mouse = parse_mouse(&seq).unwrap_or_default();
+                            }
+                            return Some(k);
                         }
-                        return Some(k);
-                    }
-                    Decoded::Incomplete => {
-                        let left = deadline.saturating_duration_since(Instant::now());
-                        if left.is_zero() || !self.fill(left.as_millis() as i32) {
+                        Decoded::Ignore(n) => {
+                            self.pending.drain(..n);
+                            ignored = true;
                             break;
                         }
+                        Decoded::Incomplete => {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            if left.is_zero() || !self.fill(left.as_millis() as i32) {
+                                break;
+                            }
+                        }
+                        Decoded::NotEscape => break,
                     }
-                    Decoded::NotEscape => break,
                 }
+                if ignored {
+                    continue;
+                }
+                self.pending.remove(0);
+                return Some(Input::Char(0x1b));
             }
-            self.pending.remove(0);
-            return Some(Input::Char(0x1b));
+            // One character in the locale's encoding.
+            let len = locale::mblen_at(&self.pending).max(1) as usize;
+            while self.pending.len() < len && self.fill(50) {}
+            let take = len.min(self.pending.len());
+            let bytes: Vec<u8> = self.pending.drain(..take).collect();
+            let c = locale::mbstowcs(&bytes, 1)
+                .and_then(|w| w.first().copied())
+                .unwrap_or(i32::from(bytes[0]));
+            return Some(Input::Char(c));
         }
-        // One character in the locale's encoding.
-        let len = locale::mblen_at(&self.pending).max(1) as usize;
-        while self.pending.len() < len && self.fill(50) {}
-        let take = len.min(self.pending.len());
-        let bytes: Vec<u8> = self.pending.drain(..take).collect();
-        let c = locale::mbstowcs(&bytes, 1)
-            .and_then(|w| w.first().copied())
-            .unwrap_or(i32::from(bytes[0]));
-        Some(Input::Char(c))
     }
 
     /// `getch`: like `get_wch` with characters as bytes; `ERR` on timeout.
@@ -914,6 +925,7 @@ pub enum Input {
 
 enum Decoded {
     Key(Input, usize),
+    Ignore(usize),
     Incomplete,
     NotEscape,
 }
@@ -969,6 +981,23 @@ fn decode_escape(b: &[u8]) -> Decoded {
     }
     if b == b"\x1b[<" || b == b"\x1b[" || b == b"\x1bO" || prefix {
         return Decoded::Incomplete;
+    }
+    // Consume unrecognized CSI sequences: ESC '[' param(0x30..=0x3f)* inter(0x20..=0x2f)* final(0x40..=0x7e).
+    const MAX_CSI_LEN: usize = 32;
+    if b.starts_with(b"\x1b[") {
+        let mut i = 2;
+        while i < b.len() && i < MAX_CSI_LEN && (0x30..=0x3f).contains(&b[i]) {
+            i += 1;
+        }
+        while i < b.len() && i < MAX_CSI_LEN && (0x20..=0x2f).contains(&b[i]) {
+            i += 1;
+        }
+        if i < b.len() && i < MAX_CSI_LEN && (0x40..=0x7e).contains(&b[i]) {
+            return Decoded::Ignore(i + 1);
+        }
+        if i == b.len() && i < MAX_CSI_LEN {
+            return Decoded::Incomplete;
+        }
     }
     Decoded::NotEscape
 }
@@ -1185,5 +1214,35 @@ mod tests {
             "missing sync start: {out:?}"
         );
         assert!(out.ends_with("\x1b[?2026l"), "missing sync end: {out:?}");
+    }
+
+    #[test]
+    fn decode_escape_consumes_unknown_csi() {
+        assert!(matches!(decode_escape(b"\x1b[1;5C"), Decoded::Ignore(6)));
+        assert!(matches!(decode_escape(b"\x1b[1;5"), Decoded::Incomplete));
+        assert!(matches!(decode_escape(b"\x1b[200~"), Decoded::Ignore(6)));
+        // Known sequences still decode to keys.
+        assert!(matches!(
+            decode_escape(b"\x1b[A"),
+            Decoded::Key(Input::Key(KEY_UP), 3)
+        ));
+        assert!(matches!(
+            decode_escape(b"\x1b[1~"),
+            Decoded::Key(Input::Key(KEY_HOME), 4)
+        ));
+        assert!(matches!(
+            decode_escape(b"\x1b[<0;1;1M"),
+            Decoded::Key(Input::Key(KEY_MOUSE), 9)
+        ));
+
+        // End-to-end: get_wch silently discards unknown CSI and returns the following key.
+        let term = FakeTerm {
+            script: [(ReadResult::Data, &b"\x1b[1;5Cq"[..])].into(),
+            size: (24, 80),
+            resize_pending: false,
+        };
+        let mut cs = Curses::with_term(Box::new(term), Box::new(std::io::sink()));
+        assert_eq!(cs.get_wch(), Some(Input::Char(i32::from(b'q'))));
+        assert_eq!(cs.get_wch(), None);
     }
 }

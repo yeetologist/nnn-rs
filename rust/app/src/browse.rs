@@ -1237,7 +1237,8 @@ impl Nnn {
                     break;
                 };
                 let n = e.file_name().into_encoded_bytes();
-                w.mvaddstr(2 + count, pcol, &n[..n.len().min(pw)]);
+                let (shown, _) = take_cols(&n, pw);
+                w.mvaddstr(2 + count, pcol, shown);
             }
             return;
         }
@@ -1250,7 +1251,8 @@ impl Nnn {
                 let t = &t[..t.len().min(PATH_MAX - 1)];
                 if !t.is_empty() {
                     let mut line = b"-> ".to_vec();
-                    line.extend_from_slice(&t[..t.len().min(pw.saturating_sub(3))]);
+                    let (shown, _) = take_cols(t, pw.saturating_sub(3));
+                    line.extend_from_slice(shown);
                     self.cs().stdscr.mvaddstr(1, pcol, &line);
                 }
             }
@@ -1305,10 +1307,13 @@ impl Nnn {
             }
             let mut off = 0usize;
             loop {
-                let end = (off + pw).min(line.len());
-                w.mvaddstr(row, pcol, line.get(off..end).unwrap_or(&[]));
+                let (chunk, step) = take_cols(&line[off..], pw);
+                w.mvaddstr(row, pcol, chunk);
                 row += 1;
-                off += pw;
+                if step == 0 {
+                    break;
+                }
+                off += step;
                 if !(off < line.len() && row < maxrows) {
                     break;
                 }
@@ -3041,6 +3046,42 @@ impl Nnn {
     }
 }
 
+/// Longest valid UTF-8 prefix of `s` whose terminal display width fits in `max_cols`
+/// (consuming at least one character when `max_cols > 0` and the first char is wider than
+/// `max_cols` to guarantee progress), together with its byte length.
+fn take_cols(s: &[u8], max_cols: usize) -> (&[u8], usize) {
+    if max_cols == 0 || s.is_empty() {
+        return (&s[..0], 0);
+    }
+    let mut bytes = 0usize;
+    let mut cols = 0usize;
+    for chunk in s.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            let cw = curses::wcwidth(ch as i32);
+            let w = if cw < 0 { 1 } else { cw as usize };
+            if cols + w > max_cols {
+                if bytes == 0 {
+                    bytes = ch.len_utf8();
+                }
+                return (&s[..bytes], bytes);
+            }
+            cols += w;
+            bytes += ch.len_utf8();
+        }
+        for _ in chunk.invalid() {
+            if cols + 1 > max_cols {
+                if bytes == 0 {
+                    bytes = 1;
+                }
+                return (&s[..bytes], bytes);
+            }
+            cols += 1;
+            bytes += 1;
+        }
+    }
+    (&s[..bytes], bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3158,5 +3199,63 @@ mod tests {
             Err(1)
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn init_locale() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::locale::init);
+    }
+
+    #[test]
+    fn take_cols_respects_utf8_and_cjk_width() {
+        init_locale();
+        assert_eq!(take_cols("日本語abc".as_bytes(), 5), ("日本".as_bytes(), 6));
+        assert_eq!(take_cols("éé".as_bytes(), 1), ("é".as_bytes(), 2));
+        assert_eq!(take_cols("日".as_bytes(), 1), ("日".as_bytes(), 3));
+        assert_eq!(take_cols(b"", 4), (&b""[..], 0));
+        assert_eq!(take_cols(b"abc", 0), (&b""[..], 0));
+    }
+
+    struct DummyTerm(i32, i32);
+
+    impl crate::curses::TermIo for DummyTerm {
+        fn size(&self) -> (i32, i32) {
+            (self.0, self.1)
+        }
+        fn read(&mut self, _wait_ms: i32, _out: &mut Vec<u8>) -> crate::platform::ReadResult {
+            crate::platform::ReadResult::Timeout
+        }
+        fn resize_pending(&self) -> bool {
+            false
+        }
+        fn set_resize_pending(&mut self, _on: bool) {}
+        fn restore(&mut self) {}
+        fn resume(&mut self) {}
+    }
+
+    #[test]
+    fn preview_lines_wraps_multibyte_utf8_cleanly() {
+        init_locale();
+        let mut nnn = Nnn {
+            curses: Some(Curses::with_term(
+                Box::new(DummyTerm(10, 10)),
+                Box::new(std::io::sink()),
+            )),
+            xlines: 10,
+            xcols: 10,
+            ..Default::default()
+        };
+        let input = "日本語テスト\n".as_bytes();
+        let mut r = BufReader::new(input);
+        nnn.preview_lines(&mut r, 0, 4);
+        let row1 = nnn.cs().stdscr.row_text(1);
+        let row2 = nnn.cs().stdscr.row_text(2);
+        let row3 = nnn.cs().stdscr.row_text(3);
+        assert!(row1.contains("日本"), "row1: {row1:?}");
+        assert!(row2.contains("語テ"), "row2: {row2:?}");
+        assert!(row3.contains("スト"), "row3: {row3:?}");
+        assert!(!row1.contains('\u{fffd}'), "row1 has U+FFFD: {row1:?}");
+        assert!(!row2.contains('\u{fffd}'), "row2 has U+FFFD: {row2:?}");
+        assert!(!row3.contains('\u{fffd}'), "row3 has U+FFFD: {row3:?}");
     }
 }

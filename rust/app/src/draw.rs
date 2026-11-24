@@ -714,45 +714,8 @@ impl Nnn {
         let pathattr = A_UNDERLINE | color_pair(self.cfg.curctx as u32 + 1);
         self.w().attron(pathattr);
         let (shown, in_home) = self.path_shown(cstr(path));
-        let i = shown.len() as i32;
-        if i + MIN_DISPLAY_COL <= ncols {
-            self.w().addnstr(&shown, ncols - MIN_DISPLAY_COL);
-        } else {
-            let base = shown.iter().rposition(|&c| c == b'/');
-            let mut p = 0usize;
-            let mut used: i32;
-            if in_home {
-                let c = shown[0];
-                self.w().addch(char::from(c));
-                p = 1;
-                used = 1;
-            } else {
-                used = 0;
-            }
-            let mut base = base;
-            if let Some(b) = base
-                && b != p
-            {
-                while p < b {
-                    if shown[p] == b'/' {
-                        used += 2;
-                        if ncols < used + MIN_DISPLAY_COL {
-                            base = None;
-                            break;
-                        }
-                        let (c1, c2) = (shown[p], shown.get(p + 1).copied().unwrap_or(0));
-                        self.w().addch(char::from(c1));
-                        p += 1;
-                        self.w().addnstr(&[c2], 1);
-                    }
-                    p += 1;
-                }
-            }
-            if let Some(b) = base {
-                self.w()
-                    .addnstr(&shown[b..], ncols - (MIN_DISPLAY_COL + used));
-            }
-        }
+        let header = shorten_path(&shown, in_home, ncols - MIN_DISPLAY_COL);
+        self.w().addstr(&header);
         self.w().attroff(pathattr);
         if self.curscroll > 0 {
             self.w().mv(1, 0);
@@ -1497,6 +1460,102 @@ pub fn wcstombs_n(w: &[i32], n: usize) -> Vec<u8> {
     out
 }
 
+/// Display width of a byte slice (invalid UTF-8 bytes count as 1 column each).
+fn display_width(s: &[u8]) -> i32 {
+    let mut w = 0i32;
+    for chunk in s.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            let cw = curses::wcwidth(ch as i32);
+            w += if cw < 0 { 1 } else { cw };
+        }
+        w += chunk.invalid().len() as i32;
+    }
+    w
+}
+
+/// First UTF-8 character (or 1 raw byte if invalid) and its display width.
+fn first_char_and_width(s: &[u8]) -> (&[u8], i32) {
+    let Some(chunk) = s.utf8_chunks().next() else {
+        return (&[], 0);
+    };
+    if let Some(ch) = chunk.valid().chars().next() {
+        let cw = curses::wcwidth(ch as i32);
+        let w = if cw < 0 { 1 } else { cw };
+        (&s[..ch.len_utf8()], w)
+    } else {
+        (&s[..1], 1)
+    }
+}
+
+/// Longest UTF-8 prefix of `s` whose terminal display width fits in `max_cols`.
+fn take_cols_fit(s: &[u8], max_cols: usize) -> &[u8] {
+    let mut bytes = 0usize;
+    let mut cols = 0usize;
+    for chunk in s.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            let cw = curses::wcwidth(ch as i32);
+            let w = if cw < 0 { 1 } else { cw as usize };
+            if cols + w > max_cols {
+                return &s[..bytes];
+            }
+            cols += w;
+            bytes += ch.len_utf8();
+        }
+        for _ in chunk.invalid() {
+            if cols + 1 > max_cols {
+                return &s[..bytes];
+            }
+            cols += 1;
+            bytes += 1;
+        }
+    }
+    &s[..bytes]
+}
+
+/// Shortens a path header to fit within `max_cols` terminal columns, keeping the first full
+/// UTF-8 character of each parent component and as much of the basename as fits.
+fn shorten_path(shown: &[u8], in_home: bool, max_cols: i32) -> Vec<u8> {
+    if max_cols <= 0 {
+        return Vec::new();
+    }
+    if display_width(shown) <= max_cols {
+        return shown.to_vec();
+    }
+    let mut out = Vec::with_capacity(shown.len());
+    let mut base = shown.iter().rposition(|&c| c == b'/');
+    let mut p = 0usize;
+    let mut used = 0i32;
+    if in_home && !shown.is_empty() {
+        out.push(shown[0]);
+        p = 1;
+        used = 1;
+    }
+    if let Some(b) = base
+        && b != p
+    {
+        while p < b {
+            if shown[p] == b'/' {
+                let (ch_bytes, ch_w) = first_char_and_width(&shown[p + 1..]);
+                used += 1 + ch_w;
+                if used > max_cols {
+                    base = None;
+                    break;
+                }
+                out.push(b'/');
+                out.extend_from_slice(ch_bytes);
+                p += 1 + ch_bytes.len();
+            } else {
+                p += 1;
+            }
+        }
+    }
+    if let Some(b) = base {
+        let rem = (max_cols - used).max(0) as usize;
+        out.extend_from_slice(take_cols_fit(&shown[b..], rem));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1518,5 +1577,24 @@ mod tests {
             ..Default::default()
         };
         assert!(nnn.onscreen() >= 1);
+    }
+
+    fn init_locale() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(locale::init);
+    }
+
+    #[test]
+    fn shorten_path_preserves_multibyte_initial_char() {
+        init_locale();
+        let path = "/日本語/フォルダ/file.txt".as_bytes();
+        let shortened = shorten_path(path, false, 20);
+        let s = std::str::from_utf8(&shortened).expect("shortened path must be valid UTF-8");
+        assert_eq!(s, "/日/フ/file.txt");
+        let mut w = Window::new(2, 28, 0, 0);
+        w.mvaddstr(0, 0, &shortened);
+        let row = w.row_text(0);
+        assert!(row.starts_with("/日/フ/file.txt"), "row: {row:?}");
+        assert!(!row.contains('\u{fffd}'), "row has U+FFFD: {row:?}");
     }
 }
