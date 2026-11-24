@@ -65,11 +65,21 @@ pub const BUTTON3_PRESSED: u32 = 0o4000;
 pub const BUTTON4_PRESSED: u32 = 0o200000;
 pub const BUTTON5_PRESSED: u32 = 0o10000000000;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Color {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cell {
     /// The character, or empty for the right half of a wide one.
     ch: String,
     attr: u32,
+    fg: Color,
+    bg: Color,
 }
 
 impl Default for Cell {
@@ -77,6 +87,8 @@ impl Default for Cell {
         Cell {
             ch: " ".to_string(),
             attr: 0,
+            fg: Color::Default,
+            bg: Color::Default,
         }
     }
 }
@@ -222,6 +234,26 @@ impl Window {
         }
     }
 
+    fn put_styled(&mut self, y: i32, x: i32, ch: String, width: i32, style: (u32, Color, Color)) {
+        let (attr, fg, bg) = style;
+        let Some(i) = self.idx(y, x) else {
+            return;
+        };
+        self.clear_wide_overlap(y, x, width);
+        self.cells[i] = Cell { ch, attr, fg, bg };
+        for k in 1..width {
+            if let Some(j) = self.idx(y, x + k) {
+                self.cells[j] = Cell {
+                    ch: String::new(),
+                    attr,
+                    fg,
+                    bg,
+                };
+            }
+        }
+        self.touched = true;
+    }
+
     fn put(&mut self, ch: String, width: i32, attr: u32) -> i32 {
         if width > self.cols - self.cx {
             // A wide character that does not fit wraps; pad the rest of the line.
@@ -233,6 +265,8 @@ impl Window {
                     self.cells[i] = Cell {
                         ch: " ".into(),
                         attr,
+                        fg: Color::Default,
+                        bg: Color::Default,
                     };
                 }
                 self.cx += 1;
@@ -243,21 +277,17 @@ impl Window {
             self.cy += 1;
             self.cx = 0;
         }
-        let Some(i) = self.idx(self.cy, self.cx) else {
+        if self.idx(self.cy, self.cx).is_none() {
             return ERR;
-        };
-        self.clear_wide_overlap(self.cy, self.cx, width);
-        self.cells[i] = Cell { ch, attr };
-        for k in 1..width {
-            if let Some(j) = self.idx(self.cy, self.cx + k) {
-                self.cells[j] = Cell {
-                    ch: String::new(),
-                    attr,
-                };
-            }
         }
+        self.put_styled(
+            self.cy,
+            self.cx,
+            ch,
+            width,
+            (attr, Color::Default, Color::Default),
+        );
         self.cx += width;
-        self.touched = true;
         if self.cx >= self.cols {
             if self.cy + 1 >= self.lines {
                 // ncurses leaves the cursor in the last cell and reports an error.
@@ -398,6 +428,111 @@ impl Window {
         self.addstr(s)
     }
 
+    /// Render a single line with ANSI SGR styling at `(y, x)`, clipped to `max_cols`.
+    pub fn mvaddansi(&mut self, y: i32, x: i32, max_cols: usize, line: &[u8]) {
+        if y < 0 || y >= self.lines || x < 0 || x >= self.cols || max_cols == 0 {
+            return;
+        }
+        self.mv(y, x);
+        let limit = max_cols.min((self.cols - x) as usize);
+        let mut col: usize = 0;
+        let mut attr: u32 = 0;
+        let mut fg = Color::Default;
+        let mut bg = Color::Default;
+        let mut i = 0;
+        while i < line.len() {
+            match line[i] {
+                0x1b => {
+                    if i + 1 < line.len() && line[i + 1] == b'[' {
+                        let start = i + 2;
+                        let mut j = start;
+                        while j < line.len() && !(0x40..=0x7e).contains(&line[j]) {
+                            j += 1;
+                        }
+                        if j < line.len() {
+                            if line[j] == b'm' {
+                                apply_sgr(&line[start..j], &mut attr, &mut fg, &mut bg);
+                            }
+                            i = j + 1;
+                        } else {
+                            i = j;
+                        }
+                    } else if i + 1 < line.len() && line[i + 1] == b']' {
+                        let mut j = i + 2;
+                        while j < line.len() {
+                            if line[j] == 0x07 {
+                                j += 1;
+                                break;
+                            }
+                            if line[j] == 0x1b && j + 1 < line.len() && line[j + 1] == b'\\' {
+                                j += 2;
+                                break;
+                            }
+                            j += 1;
+                        }
+                        i = j;
+                    } else {
+                        i = (i + 2).min(line.len());
+                    }
+                }
+                b'\r' | b'\n' => break,
+                b'\t' => {
+                    let target = ((col / 4 + 1) * 4).min(limit);
+                    while col < target {
+                        self.put_styled(y, x + col as i32, " ".into(), 1, (attr, fg, bg));
+                        col += 1;
+                    }
+                    i += 1;
+                }
+                0x00..=0x1f | 0x7f => {
+                    i += 1;
+                }
+                _ => {
+                    let len = locale::mblen_at(&line[i..]);
+                    let (c, step) = if len <= 0 {
+                        (i32::from(line[i]), 1)
+                    } else {
+                        let w = locale::mbstowcs(&line[i..i + len as usize], 1).unwrap_or_default();
+                        (w.first().copied().unwrap_or(i32::from(line[i])), len as usize)
+                    };
+                    i += step;
+                    let ch = char::from_u32(c as u32).unwrap_or('?');
+                    let w = wcwidth(c);
+                    if w < 0 {
+                        // Drop unprintable / C1 control characters so they cannot corrupt output.
+                        continue;
+                    }
+                    if w == 0 {
+                        if col > 0 {
+                            let mut bx = x + col as i32 - 1;
+                            while bx > x {
+                                if let Some(idx) = self.idx(y, bx)
+                                    && !self.cells[idx].ch.is_empty()
+                                {
+                                    break;
+                                }
+                                bx -= 1;
+                            }
+                            if let Some(idx) = self.idx(y, bx)
+                                && !self.cells[idx].ch.is_empty()
+                            {
+                                self.cells[idx].ch.push(ch);
+                                self.touched = true;
+                            }
+                        }
+                        continue;
+                    }
+                    if col + w as usize > limit {
+                        break;
+                    }
+                    self.put_styled(y, x + col as i32, ch.to_string(), w, (attr, fg, bg));
+                    col += w as usize;
+                }
+            }
+        }
+        self.cx = (x + col as i32).min(self.cols - 1);
+    }
+
     /// `wclrtoeol`
     pub fn clrtoeol(&mut self) {
         if self.cx < self.cols {
@@ -409,6 +544,8 @@ impl Window {
                 self.cells[i] = Cell {
                     ch: " ".into(),
                     attr,
+                    fg: Color::Default,
+                    bg: Color::Default,
                 };
             }
         }
@@ -447,6 +584,8 @@ impl Window {
                 win.cells[i] = Cell {
                     ch: c.to_string(),
                     attr,
+                    fg: Color::Default,
+                    bg: Color::Default,
                 };
             }
         };
@@ -474,7 +613,97 @@ impl Window {
     }
 }
 
-fn sgr(attr: u32, pairs: &[Pair; 256], colors: bool) -> String {
+struct SgrParams<'a>(&'a [u8], bool);
+
+impl<'a> SgrParams<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self(b, false)
+    }
+
+    fn next(&mut self) -> Option<u16> {
+        if self.1 {
+            return None;
+        }
+        let part = match self.0.iter().position(|&c| c == b';') {
+            Some(pos) => {
+                let head = &self.0[..pos];
+                self.0 = &self.0[pos + 1..];
+                head
+            }
+            None => {
+                self.1 = true;
+                self.0
+            }
+        };
+        let mut val: u16 = 0;
+        for &b in part {
+            if b.is_ascii_digit() {
+                val = val.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+            }
+        }
+        Some(val)
+    }
+}
+
+fn apply_sgr(params: &[u8], attr: &mut u32, fg: &mut Color, bg: &mut Color) {
+    let mut it = SgrParams::new(params);
+    while let Some(n) = it.next() {
+        match n {
+            0 => {
+                *attr = 0;
+                *fg = Color::Default;
+                *bg = Color::Default;
+            }
+            1 => *attr |= A_BOLD,
+            2 => *attr |= A_DIM,
+            3 => *attr |= A_ITALIC,
+            4 => *attr |= A_UNDERLINE,
+            5 => *attr |= A_BLINK,
+            7 => *attr |= A_REVERSE,
+            22 => *attr &= !(A_BOLD | A_DIM),
+            23 => *attr &= !A_ITALIC,
+            24 => *attr &= !A_UNDERLINE,
+            25 => *attr &= !A_BLINK,
+            27 => *attr &= !A_REVERSE,
+            30..=37 => *fg = Color::Indexed((n - 30) as u8),
+            38 => match it.next() {
+                Some(5) => {
+                    if let Some(idx) = it.next() {
+                        *fg = Color::Indexed(idx.min(255) as u8);
+                    }
+                }
+                Some(2) => {
+                    if let (Some(r), Some(g), Some(b)) = (it.next(), it.next(), it.next()) {
+                        *fg = Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
+                    }
+                }
+                _ => {}
+            },
+            39 => *fg = Color::Default,
+            40..=47 => *bg = Color::Indexed((n - 40) as u8),
+            48 => match it.next() {
+                Some(5) => {
+                    if let Some(idx) = it.next() {
+                        *bg = Color::Indexed(idx.min(255) as u8);
+                    }
+                }
+                Some(2) => {
+                    if let (Some(r), Some(g), Some(b)) = (it.next(), it.next(), it.next()) {
+                        *bg = Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
+                    }
+                }
+                _ => {}
+            },
+            49 => *bg = Color::Default,
+            90..=97 => *fg = Color::Indexed((n - 90 + 8) as u8),
+            100..=107 => *bg = Color::Indexed((n - 100 + 8) as u8),
+            _ => {}
+        }
+    }
+}
+
+fn sgr(attr: u32, fg: Color, bg: Color, pairs: &[Pair; 256], colors: bool) -> String {
+    use std::fmt::Write as _;
     let mut s = String::from("\x1b[0");
     for (bit, code) in [
         (A_BOLD, "1"),
@@ -491,14 +720,29 @@ fn sgr(attr: u32, pairs: &[Pair; 256], colors: bool) -> String {
     if attr & (A_REVERSE | A_STANDOUT) != 0 {
         s.push_str(";7");
     }
-    let pair = ((attr & A_COLOR) >> 8) as usize;
-    if colors && pair != 0 {
-        let (fg, bg) = pairs[pair];
-        for (c, base) in [(fg, 30), (bg, 40)] {
-            match c {
-                0..=7 => s.push_str(&format!(";{}", base + c)),
-                8..=255 => s.push_str(&format!(";{};5;{}", base + 8, c)),
-                _ => {}
+    if colors {
+        let pair = ((attr & A_COLOR) >> 8) as usize;
+        let (pfg, pbg) = if pair != 0 { pairs[pair] } else { (-1, -1) };
+        for (direct, fallback, base) in [(fg, pfg, 30u16), (bg, pbg, 40u16)] {
+            match direct {
+                Color::Indexed(n @ 0..=7) => {
+                    let _ = write!(s, ";{}", base + u16::from(n));
+                }
+                Color::Indexed(n) => {
+                    let _ = write!(s, ";{};5;{}", base + 8, n);
+                }
+                Color::Rgb(r, g, b) => {
+                    let _ = write!(s, ";{};2;{};{};{}", base + 8, r, g, b);
+                }
+                Color::Default => match fallback {
+                    0..=7 => {
+                        let _ = write!(s, ";{}", base as i16 + fallback);
+                    }
+                    8..=255 => {
+                        let _ = write!(s, ";{};5;{}", base + 8, fallback);
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -659,7 +903,7 @@ impl Curses {
         if clear {
             s.push_str("\x1b[0m\x1b[H\x1b[2J");
         }
-        let mut cur_attr = u32::MAX;
+        let mut cur_style: Option<(u32, Color, Color)> = None;
         let mut at: Option<(i32, i32)> = None;
         for (i, cell) in cells.iter().enumerate() {
             if self.front.get(i) == Some(cell) || cell.ch.is_empty() {
@@ -669,9 +913,16 @@ impl Curses {
             if at != Some((y, x)) {
                 s.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
             }
-            if cell.attr != cur_attr {
-                s.push_str(&sgr(cell.attr, &self.pairs, self.colors_enabled));
-                cur_attr = cell.attr;
+            let style = (cell.attr, cell.fg, cell.bg);
+            if cur_style != Some(style) {
+                s.push_str(&sgr(
+                    cell.attr,
+                    cell.fg,
+                    cell.bg,
+                    &self.pairs,
+                    self.colors_enabled,
+                ));
+                cur_style = Some(style);
             }
             s.push_str(&cell.ch);
             let w = cell
@@ -689,7 +940,7 @@ impl Curses {
                 }
             }
         }
-        if cur_attr != u32::MAX {
+        if cur_style.is_some() {
             s.push_str("\x1b[0m");
         }
         let (cy, cx) = (self.stdscr.cy, self.stdscr.cx);
@@ -710,7 +961,9 @@ impl Curses {
         self.front = vec![
             Cell {
                 ch: "\0".into(),
-                attr: 0
+                attr: 0,
+                fg: Color::Default,
+                bg: Color::Default,
             };
             self.front.len()
         ];
@@ -785,7 +1038,9 @@ impl Curses {
         self.front = vec![
             Cell {
                 ch: "\0".into(),
-                attr: 0
+                attr: 0,
+                fg: Color::Default,
+                bg: Color::Default,
             };
             (lines * cols) as usize
         ];
@@ -1244,5 +1499,114 @@ mod tests {
         let mut cs = Curses::with_term(Box::new(term), Box::new(std::io::sink()));
         assert_eq!(cs.get_wch(), Some(Input::Char(i32::from(b'q'))));
         assert_eq!(cs.get_wch(), None);
+    }
+
+    #[test]
+    fn mvaddansi_parses_colors_attrs_resets_and_skips_non_sgr() {
+        init_locale();
+        let mut w = Window::new(3, 20, 0, 0);
+        w.attrset(A_UNDERLINE);
+
+        // 16-color, bright, 256-color, 24-bit RGB, attributes, reset, non-SGR CSI, OSC (BEL & ST)
+        let line = concat!(
+            "\x1b[1;31;42mA",
+            "\x1b[22;91;104mB",
+            "\x1b[38;5;208;48;5;235mC",
+            "\x1b[38;2;10;20;30;48;2;40;50;60mD",
+            "\x1b[0mE",
+            "\x1b[2K\x1b]0;title\x07\x1b]8;;https://example.com\x1b\\F",
+            "\r\nIGNORED"
+        );
+        w.mvaddansi(0, 1, 10, line.as_bytes());
+
+        // self.attr must not be leaked/modified
+        assert_eq!(w.attr, A_UNDERLINE);
+
+        let cell = |x: i32| &w.cells[w.idx(0, x).unwrap()];
+        assert_eq!(cell(1).ch, "A");
+        assert_eq!(cell(1).attr, A_BOLD);
+        assert_eq!(cell(1).fg, Color::Indexed(1));
+        assert_eq!(cell(1).bg, Color::Indexed(2));
+
+        assert_eq!(cell(2).ch, "B");
+        assert_eq!(cell(2).attr, 0);
+        assert_eq!(cell(2).fg, Color::Indexed(9));
+        assert_eq!(cell(2).bg, Color::Indexed(12));
+
+        assert_eq!(cell(3).ch, "C");
+        assert_eq!(cell(3).fg, Color::Indexed(208));
+        assert_eq!(cell(3).bg, Color::Indexed(235));
+
+        assert_eq!(cell(4).ch, "D");
+        assert_eq!(cell(4).fg, Color::Rgb(10, 20, 30));
+        assert_eq!(cell(4).bg, Color::Rgb(40, 50, 60));
+
+        assert_eq!(cell(5).ch, "E");
+        assert_eq!(cell(5).attr, 0);
+        assert_eq!(cell(5).fg, Color::Default);
+        assert_eq!(cell(5).bg, Color::Default);
+
+        assert_eq!(cell(6).ch, "F");
+        assert_eq!(cell(7).ch, " ");
+    }
+
+    #[test]
+    fn mvaddansi_clips_and_handles_wide_chars_and_tabs() {
+        init_locale();
+        let mut w = Window::new(3, 12, 0, 0);
+
+        // CJK wide char fits in 4 cols: "a中b" = 1 + 2 + 1 = 4 cols, next 'c' clipped
+        w.mvaddansi(0, 0, 4, "\x1b[32ma中bc".as_bytes());
+        assert_eq!(w.row_text(0), "a中b        ");
+        assert_eq!(w.cells[w.idx(0, 1).unwrap()].ch, "中");
+        assert_eq!(w.cells[w.idx(0, 1).unwrap()].fg, Color::Indexed(2));
+        assert_eq!(w.cells[w.idx(0, 2).unwrap()].ch, "");
+        assert_eq!(w.cells[w.idx(0, 3).unwrap()].ch, "b");
+
+        // CJK wide char does not split when only 1 col remains (max_cols = 3 -> "ab", not half of '中')
+        w.mvaddansi(1, 0, 3, "ab中".as_bytes());
+        assert_eq!(w.row_text(1), "ab          ");
+
+        // Tab advances to 4-column stop
+        w.mvaddansi(2, 0, 8, b"x\ty");
+        assert_eq!(w.row_text(2), "x   y       ");
+    }
+
+    #[test]
+    fn refresh_emits_rgb_sgr_and_preserves_normal_pair_sgr() {
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let term = FakeTerm {
+            script: [].into(),
+            size: (2, 10),
+            resize_pending: false,
+        };
+        let mut cs = Curses::with_term(
+            Box::new(term),
+            Box::new(SharedWriter(std::rc::Rc::clone(&buf))),
+        );
+        cs.start_color();
+        cs.init_pair(1, 2, -1);
+        cs.refresh();
+        buf.borrow_mut().clear();
+
+        // Normal pair cell on row 0
+        cs.stdscr.attrset(color_pair(1));
+        cs.stdscr.mvaddstr(0, 0, b"N");
+        cs.stdscr.attrset(0);
+
+        // Two adjacent RGB cells with different colors on row 1 (same attr = 0)
+        cs.stdscr
+            .mvaddansi(1, 0, 10, b"\x1b[38;2;12;34;56mR\x1b[38;2;78;90;12mG");
+        cs.refresh();
+
+        let out = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            out.contains("\x1b[0;32mN"),
+            "normal pair SGR changed: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[0;38;2;12;34;56mR\x1b[0;38;2;78;90;12mG"),
+            "missing RGB SGR transitions: {out:?}"
+        );
     }
 }

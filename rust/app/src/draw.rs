@@ -1199,9 +1199,17 @@ impl Nnn {
         let mut c = presel;
         let mut got = true;
         let mut escaped = false;
+        let mut preview_poll = false;
         if c == 0 || c == MSGWAIT {
+            preview_poll = c == 0 && self.cfg.preview && self.browse.preview.is_pending();
+            if preview_poll {
+                self.cs().timeout(30);
+            }
             loop {
                 let input = self.cs().get_wch();
+                if preview_poll {
+                    self.settimeout();
+                }
                 got = input.is_some();
                 c = input.map_or(c, input_value);
                 if c == curses::KEY_RESIZE {
@@ -1244,12 +1252,14 @@ impl Nnn {
             }
         }
         if !got {
-            self.idle += 1;
-            if !self.cfg.sort.blkorder
-                && (self.idle & 1) != 0
-                && let Some(k) = self.poll_dir_watch()
-            {
-                c = k;
+            if !preview_poll {
+                self.idle += 1;
+                if !self.cfg.sort.blkorder
+                    && (self.idle & 1) != 0
+                    && let Some(k) = self.poll_dir_watch()
+                {
+                    c = k;
+                }
             }
         } else {
             self.idle = 0;

@@ -17,6 +17,7 @@ pub mod opts;
 pub mod platform;
 pub mod plugin;
 pub mod popup;
+pub mod preview;
 pub mod prompt;
 pub mod selection;
 pub mod session;

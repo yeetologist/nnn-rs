@@ -26,7 +26,9 @@ use crate::prompt::xconfirm;
 use crate::sort::{DIR_OR_DIRLNK, Entry, FILE_SELECTED, TimeType};
 use crate::state::{CTX_MAX, NAME_MAX, Nnn, PATH_MAX};
 use crate::sys;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
+use std::io::{IsTerminal, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -72,6 +74,7 @@ const COLOR_256: i32 = 256;
 /// `MIN_PREVIEW_COLS`
 const MIN_PREVIEW_COLS: i32 = 40;
 /// `PREVIEW_MAX_LINE`
+#[cfg(test)]
 const PREVIEW_MAX_LINE: usize = 4096;
 
 /// `FILE_MIME_OPTS` on Linux.
@@ -178,6 +181,8 @@ pub struct BrowseState {
     pub archive_re: Option<Regex>,
     /// `previewer`: the .npreview plugin path, once looked up.
     pub previewer: Option<Vec<u8>>,
+    /// Async in-process preview worker and cache for the built-in `P` pane.
+    pub preview: crate::preview::PreviewEngine,
     /// `fcolors[]` in full: [1..=CTX_MAX] are also in `Nnn::fcolors` (which has only
     /// CTX_MAX + 1 slots); the file colors C_BLK..=C_UND are only here.
     pub fcolors: [u32; C_UND + 1],
@@ -347,6 +352,7 @@ pub fn is_text_file(fpath: &[u8]) -> bool {
 }
 
 /// `fgets(line, PREVIEW_MAX_LINE, fp)`: up to 4095 bytes, through the next newline.
+#[cfg(test)]
 fn fgets(r: &mut impl BufRead) -> Option<Vec<u8>> {
     let mut line = Vec::new();
     while line.len() < PREVIEW_MAX_LINE - 1 {
@@ -850,7 +856,8 @@ impl Nnn {
         self.browse.archive_re = None;
         self.pselbuf.clear();
 
-        // Shut down inotify.
+        // Shut down inotify and any in-flight preview worker child.
+        self.browse.preview.cancel();
         self.unwatch();
         self.browse.dir_watch = None;
 
@@ -1167,8 +1174,8 @@ impl Nnn {
         self.g_ctx[ctx].c_fltr.get(i).copied().unwrap_or(0)
     }
 
-    /// `preview_pane`: the right half of the screen shows the hovered file: the .npreview
-    /// plugin's output, a directory's entries, a link's target, a text file's lines.
+    /// `preview_pane`: the right half of the screen shows the hovered file asynchronously
+    /// (`.npreview` plugin, directory, symlink, image, archive, syntax/plain text, binary).
     pub fn preview_pane(&mut self, path: &[u8]) {
         if self.ndents == 0 || !self.cfg.preview {
             return;
@@ -1193,102 +1200,38 @@ impl Nnn {
         let name = self.pdents[self.cur as usize].name.clone();
         let (fpath, _) = mkpath(path, &name, &self.home);
         let pw = previewwidth as usize;
+        let ph = (xlines - 3).max(0) as usize;
+        if ph == 0 {
+            return;
+        }
 
         // Auto-detect the .npreview plugin.
         if self.browse.previewer.is_none() {
             self.browse.previewer = Some(mkpath(&self.plgpath, UTIL_NPREVIEW, &self.home).0);
         }
-        if let Some(previewer) = self.browse.previewer.clone()
-            && platform::access(&previewer, Access::Exec).is_ok()
-        {
-            // spawn_redirected(): stdout and stderr into a pipe.
-            let Ok((reader, writer)) = std::io::pipe() else {
-                return;
-            };
-            let Ok(werr) = writer.try_clone() else {
-                return;
-            };
-            let child = std::process::Command::new(&*crate::platform::os(&previewer))
-                .arg(&*crate::platform::os(&fpath))
-                .arg(previewwidth.to_string())
-                .arg((xlines - 2).to_string())
-                .stdout(writer)
-                .stderr(werr)
-                .spawn();
-            if let Ok(mut child) = child {
-                let mut r = BufReader::new(reader);
-                self.preview_lines(&mut r, pcol, pw);
-                drop(r);
-                let _ = child.wait();
-            }
-            return;
-        }
+        let previewer = self.browse.previewer.clone();
+        let lines = self
+            .browse
+            .preview
+            .request(&fpath, previewer.as_deref(), pw, ph)
+            .map(|l| l.to_vec());
 
-        let Ok(sb) = std::fs::symlink_metadata(os(&fpath)) else {
-            return;
-        };
-        // A directory: its entries.
-        if sb.is_dir() {
-            let Ok(rd) = std::fs::read_dir(os(&fpath)) else {
-                return;
-            };
-            let maxlines = xlines - 4;
-            let w = &mut self.cs().stdscr;
-            w.mvaddstr(1, pcol, b"[directory]");
-            for (count, e) in (0..maxlines).zip(rd) {
-                let Ok(e) = e else {
-                    break;
-                };
-                let n = e.file_name().into_encoded_bytes();
-                let (shown, _) = take_cols(&n, pw);
-                w.mvaddstr(2 + count, pcol, shown);
-            }
-            return;
-        }
-        let mut size = sb.len();
-        let mut is_reg = sb.is_file();
-        // A symlink: its target, then the file it resolves to.
-        if sb.file_type().is_symlink() {
-            if let Ok(t) = std::fs::read_link(os(&fpath)) {
-                let t = crate::platform::into_bytes(t.into_os_string());
-                let t = &t[..t.len().min(PATH_MAX - 1)];
-                if !t.is_empty() {
-                    let mut line = b"-> ".to_vec();
-                    let (shown, _) = take_cols(t, pw.saturating_sub(3));
-                    line.extend_from_slice(shown);
-                    self.cs().stdscr.mvaddstr(1, pcol, &line);
+        let w = &mut self.cs().stdscr;
+        match lines {
+            Some(lines) => {
+                for (i, line) in lines.iter().take(ph).enumerate() {
+                    w.mvaddansi(1 + i as i32, pcol, pw, line);
                 }
             }
-            let Ok(sb) = std::fs::metadata(os(&fpath)) else {
-                return;
-            };
-            if !sb.is_file() {
-                return;
+            None => {
+                w.mvaddansi(1, pcol, pw, b"\x1b[2m[loading...]\x1b[0m");
             }
-            is_reg = true;
-            size = sb.len();
-        }
-        // A regular file: its lines if it is text.
-        if is_reg {
-            if size == 0 {
-                self.cs().stdscr.mvaddstr(1, pcol, b"[empty file]");
-                return;
-            }
-            if !is_text_file(&fpath) {
-                let line = format!("[binary {}]", coolsize(size as i64));
-                self.cs().stdscr.mvaddstr(1, pcol, line.as_bytes());
-                return;
-            }
-            let Ok(f) = std::fs::File::open(os(&fpath)) else {
-                return;
-            };
-            let mut r = BufReader::new(f);
-            self.preview_lines(&mut r, pcol, pw);
         }
     }
 
     /// The line loop of preview_pane() (plugin output and text files): tabs as spaces,
     /// long lines wrapped, rows 1 to `xlines - 3`.
+    #[cfg(test)]
     fn preview_lines(&mut self, r: &mut impl BufRead, pcol: i32, pw: usize) {
         let maxrows = self.xlines - 2;
         let mut row = 1;
@@ -1601,6 +1544,9 @@ impl Nnn {
         }
 
         let Some(sel) = sel else {
+            if self.cfg.preview && self.browse.preview.poll() {
+                return Flow::Top;
+            }
             return self.sel_default(b);
         };
         use Action as A;
@@ -2238,6 +2184,9 @@ impl Nnn {
             }
             Action::Preview => {
                 self.cfg.preview = !self.cfg.preview;
+                if !self.cfg.preview {
+                    self.browse.preview.cancel();
+                }
                 return Flow::Top;
             }
             _ => {
@@ -2283,7 +2232,10 @@ impl Nnn {
         }
 
         match sel {
-            Action::Redraw => refresh = true,
+            Action::Redraw => {
+                self.browse.preview.invalidate();
+                refresh = true;
+            }
             Action::Renamemul => {
                 self.endselection(true);
                 crate::locale::setenv("NNN_INCLUDE_HIDDEN", xitoa(self.cfg.sort.showhidden));
@@ -3054,6 +3006,7 @@ impl Nnn {
 /// Longest valid UTF-8 prefix of `s` whose terminal display width fits in `max_cols`
 /// (consuming at least one character when `max_cols > 0` and the first char is wider than
 /// `max_cols` to guarantee progress), together with its byte length.
+#[cfg(test)]
 fn take_cols(s: &[u8], max_cols: usize) -> (&[u8], usize) {
     if max_cols == 0 || s.is_empty() {
         return (&s[..0], 0);
