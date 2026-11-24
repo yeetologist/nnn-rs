@@ -957,6 +957,28 @@ mod tests {
             String::from_utf8(out.stdout).unwrap()
         };
         assert_eq!(run(&["cmd", "/C", "echo a&echo b"], 2), "a\r\nb\r\n");
+        // The prompt's shape: $SHELL is one word, /C and the line are added.
+        assert_eq!(run(&["cmd", "/C", "echo a&echo b"], 1), "a\r\nb\r\n");
+    }
+
+    /// The `]` prompt with a cmd $SHELL: spawn(shell, "/C", line) runs the typed line.
+    #[test]
+    fn prompt_line_runs_under_cmd_shell() {
+        let dir = std::env::temp_dir().join(format!("nnn-cmd-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let shell = std::env::var_os("COMSPEC")
+            .map_or_else(|| b"cmd.exe".to_vec(), |s| bytes(&s).into_owned());
+        let flag = super::super::shell_command_flag(&shell).to_vec();
+        let line = format!("echo x>{}&echo y>>{}", marker.display(), marker.display());
+        let st = super::super::command(&[shell, flag, line.into_bytes()], 1)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{st:?}");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x\r\ny\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A file name given to a cmd command (as to the default opener) is never parsed by cmd:

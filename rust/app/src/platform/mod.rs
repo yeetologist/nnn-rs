@@ -379,13 +379,24 @@ pub fn command(argv: &[Vec<u8>], words: usize) -> std::process::Command {
             .to_vec()
     };
     let argv: Vec<Vec<u8>> = argv.iter().map(|a| c(a)).collect();
-    let mut cmd = std::process::Command::new(&*os(&argv[0]));
     if is_cmd(&argv[0]) {
+        // cmd reads its own command line, where a / in its path starts a switch.
+        let prog: Vec<u8> = argv[0]
+            .iter()
+            .map(|&b| if b == b'/' { b'\\' } else { b })
+            .collect();
+        let mut cmd = std::process::Command::new(&*os(&prog));
+        // A /C nnn adds (the `]` prompt runs `$SHELL /C <line>`) still starts the line.
+        let words = match argv.iter().position(|a| a.eq_ignore_ascii_case(b"/C")) {
+            Some(p) if p >= words => p + 1,
+            _ => words,
+        };
         let words = words.clamp(1, argv.len());
         backend::cmd_args(&mut cmd, &argv[1..words], &argv[words..]);
-    } else {
-        cmd.args(argv[1..].iter().map(|a| os(a)));
+        return cmd;
     }
+    let mut cmd = std::process::Command::new(&*os(&argv[0]));
+    cmd.args(argv[1..].iter().map(|a| os(a)));
     cmd
 }
 
