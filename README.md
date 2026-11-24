@@ -22,11 +22,16 @@ or take the release binary `nnn.exe`. Use Windows Terminal (conhost works too).
 - Not supported (nnn says so): NNN_FIFO, mounts and archive mounting, the permission editor (chmod).
 - Differences: Ctrl-Break is ignored (like SIGQUIT on Linux); `rm -rf` of read-only files fails with "Permission denied"; locale is C.UTF-8 behaviour (code point sorting, Unicode regex classes). Full list: ADR-022..027 in `rust/DECISIONS.md`.
 
+### With Microsoft Coreutils
+
+With [Coreutils for Windows](https://learn.microsoft.com/en-us/windows/core-utils/overview) installed (`winget install Microsoft.Coreutils`, or the release zip's `coreutils.exe` on PATH), nnn finds it and runs its `cp`, `mv`, `rm`, `stat` and `xargs` where Linux nnn runs GNU's: copy, move and remove of the selection (with their own prompts), remove, duplicate, the file details popup and archiving the selection. `NNN_COREUTILS=0` turns this off. Details and differences: ADR-028.
+
 Proof commands (PowerShell, repo root):
 
     cargo test --manifest-path rust/app/Cargo.toml
     rust-anything app replay . --build rust\app\target\debug\nnn.exe          # 242/242
-    cargo run --manifest-path rust/tui-check/Cargo.toml -- check <abs path to rust\app\target\debug\nnn.exe>   # 40/40
+    cargo run --manifest-path rust/tui-check/Cargo.toml -- check <abs path to rust\app\target\debug\nnn.exe>   # 40/40 (+ --coreutils: 44/44)
+    cargo test --manifest-path rust/app/Cargo.toml -- --include-ignored   # with Coreutils installed
 
 ## Proof commands (WSL/Linux, repo root)
 

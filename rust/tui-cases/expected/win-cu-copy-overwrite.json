@@ -149,7 +149,7 @@
   {
    "after": "p",
    "screen": [
-    "cp.exe: overwrite '.\\Gamma'?",
+    "cp: overwrite '.\\Gamma'?",
     "",
     "",
     "",
@@ -178,7 +178,7 @@
   {
    "after": "n",
    "screen": [
-    "cp.exe: overwrite '.\\Gamma'? n",
+    "cp: overwrite '.\\Gamma'? n",
     "",
     "",
     "",
@@ -207,7 +207,7 @@
   {
    "after": "<Enter>",
    "screen": [
-    "cp.exe: overwrite '.\\Gamma'? n",
+    "cp: overwrite '.\\Gamma'? n",
     "",
     "'Enter' to continue",
     "",
@@ -265,7 +265,7 @@
   {
    "after": "q",
    "screen": [
-    "cp.exe: overwrite '.\\Gamma'? n",
+    "cp: overwrite '.\\Gamma'? n",
     "",
     "'Enter' to continue",
     "",

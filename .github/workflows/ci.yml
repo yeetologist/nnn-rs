@@ -83,5 +83,32 @@ jobs:
         run: cargo clippy --manifest-path rust/tui-check/Cargo.toml --all-targets -- -D warnings
       - name: tui-check fmt
         run: cargo fmt --manifest-path rust/tui-check/Cargo.toml --check
-      - name: Screen cases via tui-check (40)
+      - name: Screen cases via tui-check (40; the 4 Coreutils cases are skipped)
         run: cargo run --manifest-path rust/tui-check/Cargo.toml -- check "$env:GITHUB_WORKSPACE\rust\app\target\debug\nnn.exe"
+
+  windows-coreutils:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      # The portable layout (coreutils.exe only); a dev box with winget has the installed one.
+      - name: Microsoft Coreutils (portable zip) on PATH
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v2026.9.3 --repo microsoft/coreutils -p 'coreutils-2026.9.3-x64.zip' -D "$env:RUNNER_TEMP"
+          Expand-Archive "$env:RUNNER_TEMP\coreutils-2026.9.3-x64.zip" -DestinationPath "$env:RUNNER_TEMP\coreutils"
+          "$env:RUNNER_TEMP\coreutils\coreutils-2026.9.3-x64" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Install rust-anything
+        run: cargo install rust-anything --version 3.3.0 --locked
+      - name: Build the port
+        run: cargo build --manifest-path rust/app/Cargo.toml
+      - name: Build tui-check
+        run: cargo build --manifest-path rust/tui-check/Cargo.toml
+      - name: Replay (242 cases)
+        run: rust-anything app replay . --build rust\app\target\debug\nnn.exe
+      - name: cargo test, Coreutils tests included
+        run: cargo test --manifest-path rust/app/Cargo.toml -- --include-ignored
+      - name: Screen cases via tui-check with Coreutils (44)
+        run: cargo run --manifest-path rust/tui-check/Cargo.toml -- check "$env:GITHUB_WORKSPACE\rust\app\target\debug\nnn.exe" --coreutils

@@ -1550,7 +1550,7 @@
   "requires": [
    "coreutils"
   ],
-  "note": "Recorded on Windows with Microsoft Coreutils (hand-verified first run): p runs cp.exe -iRp, which asks its own overwrite question; n keeps dir1/Gamma, cp exits 1, so nnn waits for Enter and shows failed! with the selection kept, as GNU cp does on Linux.",
+  "note": "Recorded on Windows with Microsoft Coreutils (hand-verified first run): p runs Coreutils' cp -iRp, which asks its own overwrite question (cp.exe: from the installed layout, cp: from the portable coreutils.exe; normalized to cp:); n keeps dir1/Gamma, cp exits 1, so nnn waits for Enter and shows failed! with the selection kept, as GNU cp does on Linux.",
   "args": [],
   "keys": [
    "j",
@@ -1567,7 +1567,13 @@
    "Gamma": "new\n",
    "dir1": null,
    "dir1/Gamma": "old\n"
-  }
+  },
+  "normalize": [
+   [
+    "\\b(cp|mv|rm)\\.exe: ",
+    "\\1: "
+   ]
+  ]
  },
  {
   "name": "win-cu-copy",
@@ -1645,6 +1651,10 @@
    [
     "(Access|Modify): <NOW>:[0-9.]+ [+-]\\d+",
     "\\1: <TS>"
+   ],
+   [
+    "(Links: \\d+) +│?$",
+    "\\1"
    ]
   ]
  },

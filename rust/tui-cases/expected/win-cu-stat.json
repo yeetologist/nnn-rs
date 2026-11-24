@@ -68,7 +68,7 @@
     " dir1/    │                                                          │",
     " Gamma    │  File: <TMP>/work/dir1                      │",
     " alpha.txt│  Size: 0              Blocks: 0          IO Block: 4096",
-    " beta.md  dDevice: <DEV> Inode: <INO> Links: 1         │",
+    " beta.md  dDevice: <DEV> Inode: <INO> Links: 1",
     " big.bin  │Access: (0777/drwxrwxrwx)  Uid: (<ID>)   Gid: ( │",
     " file1    │Access: 2023-11-14 22:13:20.000000000 +0000               │",
     " file10   │Modify: 2023-11-14 22:13:20.000000000 +0000               │",
