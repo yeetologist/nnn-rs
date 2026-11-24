@@ -356,6 +356,17 @@ pub fn which(name: &[u8]) -> Option<Vec<u8>> {
     backend::which(name)
 }
 
+/// Microsoft's Coreutils for Windows, detected once per run (`NNN_COREUTILS=0` turns
+/// detection off); always `None` on Unix.
+pub fn coreutils() -> Option<&'static tools::Coreutils> {
+    backend::coreutils()
+}
+
+/// Coreutils is there and provides `tool` (`cp`, `mv`, `rm`, `stat` or `xargs`).
+pub fn has_coreutil(tool: &[u8]) -> bool {
+    coreutils().and_then(|c| c.argv0(tool)).is_some()
+}
+
 /// `sh` is there to run script plugins (always on Unix).
 pub fn has_sh() -> bool {
     backend::has_sh()
@@ -413,6 +424,12 @@ pub fn command(argv: &[Vec<u8>], words: usize) -> std::process::Command {
         };
         let words = words.clamp(1, argv.len());
         backend::cmd_args(&mut cmd, &argv[1..words], &argv[words..]);
+        return cmd;
+    }
+    // Windows: a Coreutils tool runs from the install found, by its full path.
+    if let Some(a0) = coreutils().and_then(|c| c.argv0(&argv[0])) {
+        let mut cmd = std::process::Command::new(&a0[0]);
+        cmd.args(&a0[1..]).args(argv[1..].iter().map(|a| os(a)));
         return cmd;
     }
     let mut cmd = std::process::Command::new(&*os(&argv[0]));

@@ -467,6 +467,23 @@ pub fn which(name: &[u8]) -> Option<Vec<u8>> {
     .map(|p| bytes(p.as_os_str()).into_owned())
 }
 
+pub fn coreutils() -> Option<&'static super::tools::Coreutils> {
+    static FOUND: OnceLock<Option<super::tools::Coreutils>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            use std::env::var_os;
+            super::tools::enabled(var_os("NNN_COREUTILS").as_deref())
+                .then(|| {
+                    super::tools::detect_in(
+                        var_os("PATH").as_deref(),
+                        var_os("ProgramFiles").as_deref(),
+                    )
+                })
+                .flatten()
+        })
+        .as_ref()
+}
+
 pub fn has_sh() -> bool {
     shell_exec_prefix() == b"sh -c"
 }

@@ -1,6 +1,6 @@
 //! Finding external programs: a native `PATH`/`PATHEXT` search (Windows has no `which`).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// `PATHEXT` when unset or empty.
@@ -81,10 +81,72 @@ pub fn which_in(name: &[u8], path_var: Option<&OsStr>, pathext: Option<&OsStr>) 
         .find_map(|d| first_file(&d.join(&name_path)))
 }
 
+/// The tools nnn runs that Microsoft's Coreutils for Windows provides.
+pub const COREUTILS_TOOLS: [&str; 5] = ["cp", "mv", "rm", "stat", "xargs"];
+
+/// How a Coreutils install is laid out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layout {
+    /// The winget install: one program per tool name (`cp.exe`, …) beside
+    /// `coreutils-manager.exe` in this bin directory.
+    Installed(PathBuf),
+    /// The release zip: this `coreutils.exe` runs a tool named as its first argument.
+    Multicall(PathBuf),
+}
+
+/// A detected Coreutils for Windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coreutils {
+    pub layout: Layout,
+}
+
+impl Coreutils {
+    /// The program and leading arguments that run `tool` (one of `COREUTILS_TOOLS`), or
+    /// `None` for any other name or a tool the install lacks (`coreutils-manager disable`).
+    pub fn argv0(&self, tool: &[u8]) -> Option<Vec<OsString>> {
+        let tool = std::str::from_utf8(tool).ok()?;
+        if !COREUTILS_TOOLS.contains(&tool) {
+            return None;
+        }
+        match &self.layout {
+            Layout::Installed(dir) => {
+                let exe = dir.join(format!("{tool}.exe"));
+                exe.is_file().then(|| vec![exe.into_os_string()])
+            }
+            Layout::Multicall(exe) => Some(vec![exe.clone().into_os_string(), tool.into()]),
+        }
+    }
+}
+
+/// Coreutils as found on `path_var` (each directory in order: `coreutils-manager.exe` there
+/// means the installed layout, else `coreutils.exe` the multicall one), else in
+/// `<program_files>/coreutils/bin` (the winget location). Only files are checked; nothing runs.
+pub fn detect_in(path_var: Option<&OsStr>, program_files: Option<&OsStr>) -> Option<Coreutils> {
+    let at = |dir: &Path| {
+        if dir.join("coreutils-manager.exe").is_file() {
+            Some(Layout::Installed(dir.to_path_buf()))
+        } else {
+            let exe = dir.join("coreutils.exe");
+            exe.is_file().then_some(Layout::Multicall(exe))
+        }
+    };
+    let found = path_dirs(path_var).iter().find_map(|d| at(d)).or_else(|| {
+        let bin = Path::new(program_files?).join("coreutils").join("bin");
+        bin.join("coreutils-manager.exe")
+            .is_file()
+            .then_some(Layout::Installed(bin))
+    });
+    found.map(|layout| Coreutils { layout })
+}
+
+/// Detection is on unless `NNN_COREUTILS` is `0`.
+pub fn enabled(var: Option<&OsStr>) -> bool {
+    var != Some(OsStr::new("0"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fresh temp dir holding `files` (empty files; a trailing `/` makes a directory).
@@ -195,5 +257,107 @@ mod tests {
             which_in(b"foo", Some(&p), None),
             Some(t.join("d").join("foo.CMD"))
         );
+    }
+    #[test]
+    fn detect_installed_layout() {
+        let t = tree(&["d/coreutils-manager.exe", "d/cp.exe"]);
+        let c = detect_in(Some(&paths(&[t.join("d")])), None).unwrap();
+        assert_eq!(c.layout, Layout::Installed(t.join("d")));
+        assert_eq!(
+            c.argv0(b"cp"),
+            Some(vec![t.join("d").join("cp.exe").into_os_string()])
+        );
+    }
+
+    #[test]
+    fn detect_multicall_layout() {
+        let t = tree(&["d/coreutils.exe"]);
+        let c = detect_in(Some(&paths(&[t.join("d")])), None).unwrap();
+        let exe = t.join("d").join("coreutils.exe");
+        assert_eq!(c.layout, Layout::Multicall(exe.clone()));
+        assert_eq!(
+            c.argv0(b"rm"),
+            Some(vec![exe.into_os_string(), OsString::from("rm")])
+        );
+    }
+
+    #[test]
+    fn detect_first_path_hit_wins() {
+        let t = tree(&["d1/coreutils.exe", "d2/coreutils-manager.exe"]);
+        let c = detect_in(Some(&paths(&[t.join("d1"), t.join("d2")])), None).unwrap();
+        assert_eq!(
+            c.layout,
+            Layout::Multicall(t.join("d1").join("coreutils.exe"))
+        );
+    }
+
+    #[test]
+    fn detect_program_files_fallback() {
+        let t = tree(&["pf/coreutils/bin/coreutils-manager.exe", "empty/"]);
+        let pf = t.join("pf");
+        let c = detect_in(Some(&paths(&[t.join("empty")])), Some(pf.as_os_str())).unwrap();
+        assert_eq!(
+            c.layout,
+            Layout::Installed(pf.join("coreutils").join("bin"))
+        );
+    }
+
+    #[test]
+    fn detect_none() {
+        let t = tree(&["d/cp.exe"]);
+        assert!(detect_in(Some(&paths(&[t.join("d")])), Some(t.as_os_str())).is_none());
+        assert!(detect_in(None, None).is_none());
+    }
+
+    #[test]
+    fn argv0_installed_missing_tool_is_none() {
+        let t = tree(&["d/coreutils-manager.exe", "d/cp.exe"]);
+        let c = detect_in(Some(&paths(&[t.join("d")])), None).unwrap();
+        assert_eq!(c.argv0(b"rm"), None);
+        assert!(c.argv0(b"cp").is_some());
+    }
+
+    #[test]
+    fn argv0_unknown_tool_is_none() {
+        let t = tree(&[
+            "i/coreutils-manager.exe",
+            "i/sed.exe",
+            "i/cp.exe.exe",
+            "m/coreutils.exe",
+        ]);
+        for d in ["i", "m"] {
+            let c = detect_in(Some(&paths(&[t.join(d)])), None).unwrap();
+            assert_eq!(c.argv0(b"sed"), None);
+            assert_eq!(c.argv0(b"cp.exe"), None);
+        }
+    }
+
+    #[test]
+    fn enabled_reads_env_value() {
+        assert!(enabled(None));
+        assert!(!enabled(Some(OsStr::new("0"))));
+        assert!(enabled(Some(OsStr::new("1"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Microsoft Coreutils"]
+    fn real_cp_through_command() {
+        let t = tree(&[]);
+        let src = t.join("src");
+        let dst = t.join("dst");
+        std::fs::write(&src, b"hello").unwrap();
+        let b = |p: &Path| crate::platform::into_bytes(p.as_os_str().to_owned());
+        let argv = [
+            b"cp".to_vec(),
+            b"-rp".to_vec(),
+            b"--".to_vec(),
+            b(&src),
+            b(&dst),
+        ];
+        let mut cmd = crate::platform::command(&argv, 1);
+        assert!(Path::new(cmd.get_program()).is_absolute());
+        assert!(cmd.status().unwrap().success());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
     }
 }

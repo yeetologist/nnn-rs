@@ -341,6 +341,10 @@ pub fn which(_name: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+pub fn coreutils() -> Option<&'static super::tools::Coreutils> {
+    None
+}
+
 pub fn cmd_args(cmd: &mut Command, words: &[Vec<u8>], added: &[Vec<u8>]) {
     cmd.args(words.iter().chain(added).map(|a| os(a)));
 }
