@@ -79,7 +79,7 @@ Decision: Port nnn's native xreadline and history functions instead of writing a
 Consequences: Prompt behaviour is the original's own code, ported.
 
 ## ADR-014: Locale, regex and time come from glibc, through one FFI module
-Status: accepted (2026-11-23), user to confirm
+Status: accepted (2026-11-23), user to confirm; the "only module with unsafe" rule is superseded by ADR-022
 Context: The original sorts names with strcoll (LC_COLLATE), folds case and measures widths with mbstowcs/towlower/wcswidth (LC_CTYPE), folds bytes with tolower in strcasestr/strcasecmp, filters with POSIX regcomp/regexec (REG_EXTENDED|REG_ICASE), and prints times with localtime_r (TZ). No Rust crate reproduces glibc's locale tables, Unicode version or POSIX regex syntax; the oracle showed them matter (tr_TR, de_DE, en_US collation).
 Decision: rust/app/src/locale.rs calls these glibc functions through the libc crate (and four extern declarations libc lacks). It is the only module with `unsafe`, each block with a SAFETY comment. main() calls setlocale(LC_COLLATE/LC_CTYPE, "") as the original does. Directory reading uses rustix (safe API).
 Consequences: Identical results in every locale; the binary stays glibc/Linux-bound (ADR-002). Replacing glibc later means accepting differences, as a new ADR.
@@ -119,3 +119,52 @@ Status: accepted (2026-11-23)
 Context: `rust-anything app lift` expects unit crates wired with `app wire`; this port is one crate of modules (ADR-011), so the tool refused (no wired unit, front door changed).
 Decision: The lift was done by hand: rust/app/src/original.rs, both kill switches and the fallback paths in startup.rs/main.rs are gone; rust/app/tests/app_cases.rs runs rust/app-cases with trycmd on `cargo test`. The C source stays in src/ as reference (ADR-008).
 Consequences: The binary links no ncurses or readline. Proof on the pure binary: cargo test (57 unit tests + 242 app cases), app replay 242/242, bytes-check 246/246, tui 48/48 (archive-current waits for 1.5 s of stillness: tar's run made its snapshot racy for the original too), function oracle 15/15. Speed from tmpfs: startup about 0.1-0.3 ms slower (1.2 MB binary vs 168 KB), listing and sorting 20,000 files about 8% faster.
+
+## ADR-021: Standalone repo with the C original as a submodule
+Status: accepted (2026-11-24)
+Context: The port lived in nnn/rust/, inside a checkout of the C project. A Windows port needs its own CI, its own history and a clean way to build the C original for the proofs.
+Decision: nnn-rs is a separate repository. rust/ (crate, proofs, docs) is its own content; reference/nnn is a git submodule of https://github.com/jarun/nnn pinned at a93d0bd4. `git submodule update --init && make -C reference/nnn` builds the original used by replay, bytes-check, the screen harnesses and the oracles. .gitattributes marks recorded fixtures and cases `-text` so CRLF survives a Windows checkout.
+Consequences: CI checks out with submodules. Nothing is pushed or published without the user's go-ahead (ADR-007).
+
+## ADR-022: Platform layer; where unsafe may live (supersedes ADR-014's locale.rs rule)
+Status: accepted (2026-11-24)
+Context: ADR-014 made locale.rs the only module with `unsafe`. The Windows port needs console, file-information and process APIs, and the Unix code (curses termios, directory reading, ids, time) has to sit behind the same interface.
+Decision: rust/app/src/platform/ is the OS boundary: mod.rs (the OS-independent API, re-exporting the active backend, and the path helpers), unix.rs, windows.rs and portable_locale.rs (ADR-023). `unsafe` is allowed only in platform/unix.rs and platform/windows.rs, each block with a `// SAFETY:` comment. locale.rs is a thin facade over platform with the same public functions. No `#[allow]`; `#[expect(.., reason = "..")]` only. Unix-only crates (rustix, libc) sit under `[target.'cfg(unix)'.dependencies]`, Windows-only (windows-sys, chrono) under `[target.'cfg(windows)'.dependencies]`. Linux behaviour stays byte-identical to the C original.
+Consequences: Everything outside platform/ is safe Rust and OS-neutral. ADR-014's choice of glibc on Linux stands; only its "only locale.rs" sentence is replaced.
+
+## ADR-023: Windows locale reference is C.UTF-8; the portable backend and its known differences
+Status: accepted (2026-11-24)
+Context: Windows has no glibc. nnn's sorting, case folding, widths, regex and time come from glibc locale tables (ADR-014).
+Decision: platform/portable_locale.rs is a pure-Rust backend (unicode-width, regex, chrono), always used on Windows and on Unix with `--features portable`. Its reference is glibc's C.UTF-8, not ASCII: regex classes ([[:alpha:]], \w, ignore-case folding) are Unicode-aware as in C.UTF-8, collation is code point order, widths follow unicode-width. It is proven by the function oracle on Linux: `LOCALES=C.UTF-8 rust/oracle/run.sh <oracle built with --features portable,oracles>` gives 3/3 runs identical (seeds 1, 7, 100; 20000 calls each). What the oracle cannot reach (Unicode table versions, wcwidth oddities, [[:graph:]]/[[:print:]]/[[:punct:]], back-references, non-UTF-8 pattern bytes, malformed TZ) is listed in rust/oracle/portable-known-diffs.md.
+Consequences: Other locales (en_US, tr_TR, de_DE collation) are not reproduced on Windows. The glibc backend stays the Linux default and its 15/15 oracle is unchanged.
+
+## ADR-024: Windows feature matrix
+Status: accepted (2026-11-24)
+Context: Some nnn features rest on Unix concepts, others on tools Windows lacks. The target is x86_64-pc-windows-msvc, Windows 10 1809+ (ConPTY, VT sequences), Windows Terminal and conhost.
+Decision:
+- Unsupported, with nnn's own message: FIFO (the NNN_FIFO preview and selection feed), mounts (the mount/unmount key and FUSE archives), chmod (the permission editor).
+- Ctrl-C is a key as on Linux. Ctrl-Break is ignored, like SIGQUIT on Linux, so the console modes stay intact; closing the console window exits.
+- Git for Windows (sh.exe on PATH) is needed for sh-based plugins and for POSIX syntax in the shell and the command prompt; without it the shell and prompt fall back to `cmd /C` and plugins say "sh not found (Git for Windows)". Plain programs (editor, pager) run without it. The default opener is `cmd /C start ""`.
+- List mode (paths from stdin, built as a tree of symlinks) needs symlink rights: Developer Mode or an elevated shell.
+- Directory sizes, permission strings, link counts and the detail-mode octal column are NTFS approximations (ADR-027 wildcards them in screen cases).
+- No shared recorded case is filtered on Windows: all 242 replay cases pass; 12 of the 48 screen cases are marked unix-only because they need Unix tools or Unix file details (36 shared + 4 Windows-only cases run).
+Consequences: Config, session and selection file formats are unchanged (ADR-006). Windows-specific behaviour lives in rust/app-cases-windows and the Windows-only screen cases.
+
+## ADR-025: Windows paths
+Status: accepted (2026-11-24)
+Context: nnn's code splits, joins and compares paths as bytes with `/`.
+Decision: Internal paths are byte strings with `/` separators on every OS. On Windows the bytes are WTF-8 from `OsStr::as_encoded_bytes` (lone surrogates round-trip) and are only split at `/`; conversions to OsStr/UTF-16 happen at the platform boundary. Roots: `C:/` (drive roots; `h` there stays put like `/` on Linux), UNC `//server/share/` (going up stops there), and a drive-less `/x` means `x` on the current working directory's drive. Paths of 260 or more characters get the `\\?\` prefix when handed to the OS.
+Consequences: The `\\?\` form bypasses GetFullPathNameW normalisation (no `..` or `/` fix-up past that point; the platform layer normalises first). Names never contain `\` separators on screen.
+
+## ADR-026: Native file operations on Windows
+Status: accepted (2026-11-24)
+Context: On Linux nnn runs cp, mv and rm (and xdg tools) from the shell; Windows has none of them without Git for Windows.
+Decision: rust/app/src/winops.rs does copy, move, remove, the file-information panel and directory-change polling natively. nnn's prompt texts are kept (overwrite, delete, "rm -rf" confirmations). Links are never followed and never replace a real directory; a tree is removed only after its prompt. File names are never put on a command line: they travel in environment variables (%NNN_CMD_ARGn%, `cmd /V:OFF`), so a name such as `a&calc.exe` cannot inject commands. Errors use glibc's strerror wording.
+Known differences from Linux: `rm -rf` of a read-only file fails with "Permission denied" (rm removes it); `rm -v` output quotes names with control characters differently from GNU rm; directory-change polling misses content-only changes; a move of a directory onto an existing directory across volumes merges the trees, mv refuses a non-empty target.
+Consequences: Locked files and paths over 259 characters report an error, never panic.
+
+## ADR-027: tui-check, the cross-platform screen harness
+Status: accepted (2026-11-24)
+Context: harness.py needs tmux and so runs on Linux only (ADR-016).
+Decision: rust/tui-check (a standalone crate) runs the same rust/tui-cases/cases.json against the same expected files through a pty (ConPTY on Windows) and the vt100 crate. `check` compares, `record` re-records. On Windows it normalises what NTFS cannot match (permission strings, detail octal column, directory sizes, the N-INODE suffix, the temp directory in `\` and `/` spellings) and skips cases whose `platforms` list excludes it. Case directories are created at the drive root (C:\nnnh-...) so path lengths match the recorded ones; a UNC %TEMP% breaks that parity. ConPTY's host asks the program's terminal for the cursor position (DSR, ESC[6n) and waits for the answer, so the harness answers every request from the vt100 cursor, as tmux does.
+Consequences: Linux: 48/48 against both Rust and the C original, agreeing with harness.py. Windows: 40/40 (36 shared + 4 Windows-only).

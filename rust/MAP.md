@@ -1,6 +1,6 @@
 # nnn → Rust port map
 
-Goal: pure Rust `nnn` (default build) behaving as the C original. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..008; W7 adds 021-027). Terms: [GLOSSARY.md](GLOSSARY.md). Measured state: PORT_MAP.md (generated).
+Goal: pure Rust `nnn` (default build) behaving as the C original. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..027; W7 adds 021-027). Terms: [GLOSSARY.md](GLOSSARY.md). Measured state: PORT_MAP.md (generated).
 
 | Wave | Unit | State |
 |---|---|---|
@@ -10,7 +10,7 @@ Goal: pure Rust `nnn` (default build) behaving as the C original. Decisions: [DE
 | W4 | curses layer, drawing/navigation/filters/contexts (draw.rs), browse loop + TUI main + colors + FIFO + inotify + preview (browse.rs), prompts + native line editor + history (prompt.rs), spawn/popups/stats/help (popup.rs), config/bookmarks/kv (config.rs), selection buffer (selection.rs), list mode (listmode.rs) | done 2026-11-23 behind RUST_ANYTHING_UNIT_TUI=rust (ADR-018): tui 30/30, replay 242/242 (fallback 0%), bytes 246/246; module oracles: prompt 150k, config 240k, browse 15k, listmode 39 cases, popup (ASCII windows identical) |
 | W5 | fileops.rs (copy/move/remove selection, batch rename, edit selection), mounts.rs (archives, mounts), plugin.rs (plugins, cmd prompt, shell, launcher, child env), session.rs (save/load, byte-identical files), du.rs (disk usage mode); Rust TUI made the default (ADR-019) | done 2026-11-23: tui 48/48 (original 48/48), replay 242/242 fallback 0%, bytes 246/246, function oracle 15/15; module oracles: fileops 15k, session 6 seeds + 1,323 cross-loads, du 5,400 calls |
 | W6 | lift: fallback and kill switches removed, app-cases as cargo test (ADR-020) | done 2026-11-23: pure binary tui 48/48, replay 242/242, bytes 246/246, cargo test green, oracle 15/15 |
-| W7 | Windows: platform layer, console, portable locale, native file ops, tui-check | in progress: T1-T9 done (Linux 91 unit, 242/242 replay, 246/246 bytes, 48/48 tui via harness.py and tui-check vs Rust and C, 15 oracle ok; Windows: cargo test 110 unit + 1 + 8 integration, clippy clean, replay 242/242, tui-check 40/40) |
+| W7 | Windows: platform layer, console, portable locale, native file ops, tui-check, CI, ADR-021..027 | done 2026-11-24. Windows: replay 242/242, tui-check 40/40 (36 shared + 4 Windows-only; 12 unix-only skipped), cargo test 110 unit + 1 + 8 integration passed, clippy -D warnings and fmt clean. Linux: cargo test 91 unit + 242 app cases, replay 242/242, bytes 246/246, harness.py 48/48, tui-check 48/48 (Rust and C), function oracle 15 ok, portable-locale oracle (LOCALES=C.UTF-8, --features portable,oracles) 3/3 ok, clippy and fmt clean. CI: .github/workflows/ci.yml (linux, windows) |
 
 Out of scope (ADR-003): icon builds, haiku, macos-legacy, PCRE build.
 
