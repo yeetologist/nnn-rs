@@ -1112,9 +1112,16 @@ impl Nnn {
             let Some(content) = self.buffer_command_output(&cmds, Some(pathbuf), None) else {
                 return false;
             };
-            // Windows has no stat or file: the entry's details come from winops.
+            // Windows has no file: Coreutils' stat when installed, else winops' details.
             #[cfg(windows)]
-            let content = crate::winops::file_info_text(pathbuf);
+            let content = if platform::has_coreutil(b"stat") {
+                let Some(c) = self.buffer_command_output(&[b"stat"], Some(pathbuf), None) else {
+                    return false;
+                };
+                c
+            } else {
+                crate::winops::file_info_text(pathbuf)
+            };
 
             let mut action: Option<Action> = None; // SEL_MAX
             if !self.show_content_in_floating_window(&content, Some(&mut action), true) {

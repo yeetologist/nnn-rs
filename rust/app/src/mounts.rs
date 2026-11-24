@@ -95,6 +95,20 @@ fn extract_dir_suggestion(fpath: &[u8]) -> Vec<u8> {
     }
 }
 
+/// `<system_root>\System32\tar.exe -acvf` when that file exists, else `tar -acvf`.
+#[cfg(windows)]
+fn windows_tar_cmd(system_root: Option<&std::ffi::OsStr>) -> Vec<u8> {
+    let tar = system_root.map(|r| std::path::Path::new(r).join("System32").join("tar.exe"));
+    match tar.filter(|t| t.is_file()) {
+        Some(t) => [
+            crate::platform::into_bytes(t.into_os_string()),
+            b" -acvf".to_vec(),
+        ]
+        .concat(),
+        None => ARCHIVE_CMD[3].to_vec(),
+    }
+}
+
 impl Nnn {
     /// `printwarn(presel)` for an error Rust reports instead of leaving it in errno.
     fn printwarn_err(&mut self, e: &io::Error, presel: Option<&mut i32>) {
@@ -118,6 +132,12 @@ impl Nnn {
         } else {
             3 // tar
         };
+        // Windows: its own tar (bsdtar) takes drive paths; Git for Windows' GNU tar, often
+        // first on PATH, reads "C:/x.tar" as a remote host.
+        #[cfg(windows)]
+        if i == 3 {
+            return windows_tar_cmd(std::env::var_os("SystemRoot").as_deref());
+        }
         ARCHIVE_CMD[i].to_vec()
     }
 
@@ -160,36 +180,46 @@ impl Nnn {
             tmpfile = Some(tmp);
         }
 
-        let archive_esc = shell_escape(archive);
         let selpath = match &tmpfile {
             Some(t) => t.clone(),
             None => self.selpath.clone().unwrap_or_default(),
         };
-        let selpath_esc = shell_escape(&selpath);
 
-        let mut buf: Vec<u8> = Vec::new();
-        if relative {
-            let path_esc = shell_escape(path);
-            buf.extend_from_slice(b"cd ");
-            buf.extend_from_slice(&path_esc);
-            buf.extend_from_slice(b" && xargs -0 ");
+        if cfg!(windows) && crate::platform::has_coreutil(b"xargs") {
+            // Coreutils' xargs reads the list itself (-a): no shell, no quoting.
+            let mut argv = vec![b"xargs".to_vec(), b"-0".to_vec(), b"-a".to_vec(), selpath];
+            argv.extend(crate::popup::parseargs(cstr(cmd)).unwrap_or_default());
+            argv.push(cstr(archive).to_vec());
+            let cwd = relative.then(|| cstr(path));
+            self.spawn_argv(&argv, 1, cwd, F_CLI | F_CONFIRM);
         } else {
-            // patterns[P_ARCHIVE_CMD]: "xargs -0 %s %s < %s"
-            buf.extend_from_slice(b"xargs -0 ");
-        }
-        buf.extend_from_slice(cstr(cmd));
-        buf.push(b' ');
-        buf.extend_from_slice(&archive_esc);
-        buf.extend_from_slice(b" < ");
-        buf.extend_from_slice(&selpath_esc);
+            let archive_esc = shell_escape(archive);
+            let selpath_esc = shell_escape(&selpath);
 
-        self.spawn(
-            crate::platform::shell_exec_prefix(),
-            Some(&buf),
-            None,
-            None,
-            F_CLI | F_CONFIRM,
-        );
+            let mut buf: Vec<u8> = Vec::new();
+            if relative {
+                let path_esc = shell_escape(path);
+                buf.extend_from_slice(b"cd ");
+                buf.extend_from_slice(&path_esc);
+                buf.extend_from_slice(b" && xargs -0 ");
+            } else {
+                // patterns[P_ARCHIVE_CMD]: "xargs -0 %s %s < %s"
+                buf.extend_from_slice(b"xargs -0 ");
+            }
+            buf.extend_from_slice(cstr(cmd));
+            buf.push(b' ');
+            buf.extend_from_slice(&archive_esc);
+            buf.extend_from_slice(b" < ");
+            buf.extend_from_slice(&selpath_esc);
+
+            self.spawn(
+                crate::platform::shell_exec_prefix(),
+                Some(&buf),
+                None,
+                None,
+                F_CLI | F_CONFIRM,
+            );
+        }
 
         if let Some(t) = tmpfile {
             sys::unlink(&t);
@@ -486,6 +516,20 @@ impl Nnn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_tar_prefers_system32() {
+        let root = std::env::temp_dir().join(format!("nnn-sysroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("System32")).unwrap();
+        assert_eq!(windows_tar_cmd(Some(root.as_os_str())), b"tar -acvf");
+        std::fs::write(root.join("System32").join("tar.exe"), b"").unwrap();
+        let tar = root.join("System32").join("tar.exe").into_os_string();
+        let want = [crate::platform::into_bytes(tar), b" -acvf".to_vec()].concat();
+        assert_eq!(windows_tar_cmd(Some(root.as_os_str())), want);
+        assert_eq!(windows_tar_cmd(None), b"tar -acvf");
+    }
 
     #[test]
     fn escapes_quotes() {

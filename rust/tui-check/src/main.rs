@@ -4,7 +4,7 @@
 //! the same env, key bytes, settle rule, normalization, work-tree hashes and snapshot JSON,
 //! compared with the same expected/*.json.
 //!
-//!   tui-check check <build...> [--case NAME]... [--verbose]
+//!   tui-check check <build...> [--case NAME]... [--verbose] [--coreutils]
 //!   tui-check record <build...> [--case NAME]...   write expected/<case>.json from the build
 //!
 //! A key token "<Resize COLSxROWS>" resizes the pty instead of typing.
@@ -220,6 +220,12 @@ fn strs(case: &Value, key: &str) -> Vec<String> {
         .iter()
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect()
+}
+
+/// Whether the case lists "coreutils" in "requires": it runs only with --coreutils, against
+/// Microsoft's Coreutils for Windows found on PATH.
+fn needs_coreutils(case: &Value) -> bool {
+    strs(case, "requires").iter().any(|r| r == "coreutils")
 }
 
 /// Whether the case's "platforms" (all platforms when absent) includes this one.
@@ -539,6 +545,11 @@ fn case_env(home: &Path, work: &Path, case: &Value) -> Vec<(String, String)> {
             }
         }
     }
+    // Coreutils on PATH changes nnn's file operations on Windows: only the cases that require
+    // it see it.
+    if !needs_coreutils(case) {
+        env.push(("NNN_COREUTILS".to_owned(), "0".to_owned()));
+    }
     if let Some(own) = case.get("env").and_then(Value::as_object) {
         for (k, v) in own {
             let v = v.as_str().unwrap_or_default().to_owned();
@@ -714,16 +725,20 @@ fn unified_diff(a: &[&str], b: &[&str]) -> Vec<String> {
 struct Options {
     only: Vec<String>,
     verbose: bool,
+    /// Run the cases that require Microsoft's Coreutils (skipped otherwise).
+    coreutils: bool,
     build: Vec<String>,
 }
 
-const USAGE: &str = "usage: tui-check (check|record) <build...> [--case NAME]... [--verbose]";
+const USAGE: &str =
+    "usage: tui-check (check|record) <build...> [--case NAME]... [--verbose] [--coreutils]";
 
 fn parse(args: &[String]) -> Res<(String, Options)> {
     let (mode, rest) = args.split_first().ok_or(USAGE)?;
     let mut o = Options {
         only: Vec::new(),
         verbose: false,
+        coreutils: false,
         build: Vec::new(),
     };
     let mut it = rest.iter();
@@ -731,6 +746,7 @@ fn parse(args: &[String]) -> Res<(String, Options)> {
         match a.as_str() {
             "--case" => o.only.push(it.next().ok_or(USAGE)?.clone()),
             "--verbose" => o.verbose = true,
+            "--coreutils" => o.coreutils = true,
             _ => o.build.push(a.clone()),
         }
     }
@@ -751,6 +767,15 @@ fn case_name(case: &Value) -> Res<&str> {
     Ok(case["name"].as_str().ok_or("case without a name")?)
 }
 
+/// A case that requires Coreutils, without --coreutils: reported and not counted.
+fn skipped(o: &Options, case: &Value, name: &str) -> bool {
+    let skip = needs_coreutils(case) && !o.coreutils;
+    if skip {
+        println!("SKIP {name} (requires coreutils)");
+    }
+    skip
+}
+
 fn named(o: &Options, name: &str) -> bool {
     o.only.iter().any(|n| n == name)
 }
@@ -765,6 +790,9 @@ fn record(o: &Options) -> Res<bool> {
     for case in &load_cases()? {
         let name = case_name(case)?;
         if !(named(o, name) || (o.only.is_empty() && runs_here(case))) {
+            continue;
+        }
+        if skipped(o, case, name) {
             continue;
         }
         total += 1;
@@ -787,6 +815,9 @@ fn check(o: &Options) -> Res<bool> {
     for case in &load_cases()? {
         let name = case_name(case)?;
         if (!o.only.is_empty() && !named(o, name)) || !runs_here(case) {
+            continue;
+        }
+        if skipped(o, case, name) {
             continue;
         }
         total += 1;
@@ -945,6 +976,21 @@ mod tests {
                 "e/f/g 95cb0bfd29"
             ]
         );
+    }
+
+    #[test]
+    fn coreutils_pinned_off_unless_required() {
+        let (h, w) = (Path::new("h"), Path::new("w"));
+        let pin = ("NNN_COREUTILS".to_owned(), "0".to_owned());
+        assert!(case_env(h, w, &json!({"name": "x"})).contains(&pin));
+        let env = case_env(h, w, &json!({"name": "x", "requires": ["coreutils"]}));
+        assert!(!env.iter().any(|(k, _)| k == "NNN_COREUTILS"));
+    }
+
+    #[test]
+    fn requires_coreutils_field() {
+        assert!(needs_coreutils(&json!({"requires": ["coreutils"]})));
+        assert!(!needs_coreutils(&json!({"name": "x"})));
     }
 
     #[test]
