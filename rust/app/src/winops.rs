@@ -87,6 +87,22 @@ pub fn copy_into(
     copy_entry(src, &join(dest_dir, base(src)), ask)
 }
 
+/// `cp -rp src dst`: copies `src` to the explicit target path `dst`, overwriting an
+/// existing file and keeping modification times. Refuses copying onto itself or (for a
+/// real directory) inside itself (`EINVAL`).
+pub fn copy_to(src: &[u8], dst: &[u8]) -> io::Result<()> {
+    let src_parent = fs::canonicalize(path(platform::xdirname(src)))?;
+    let src_full = src_parent.join(&*platform::os(base(src)));
+    let dst_parent = fs::canonicalize(path(platform::xdirname(dst)))?;
+    let dst_full =
+        fs::canonicalize(path(dst)).unwrap_or_else(|_| dst_parent.join(&*platform::os(base(dst))));
+    let real_dir = fs::symlink_metadata(path(src))?.is_dir();
+    if dst_full == src_full || (real_dir && dst_full.starts_with(&src_full)) {
+        return Err(platform::error(Errno::Inval));
+    }
+    copy_entry(src, dst, &mut |_| true)
+}
+
 fn copy_entry(src: &[u8], dst: &[u8], ask: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
     let meta = fs::symlink_metadata(path(src))?;
     let existing = fs::symlink_metadata(path(dst)).ok();
@@ -940,5 +956,74 @@ mod tests {
     fn attribute_names() {
         assert_eq!(attrib_names(0x1 | 0x2 | 0x20), "READONLY HIDDEN ARCHIVE");
         assert_eq!(attrib_names(0), "");
+    }
+
+    #[test]
+    fn copy_to_copies_file_to_new_name() {
+        let dir = scratch("cpto-file");
+        let a = dir.join("a");
+        let dst = dir.join("b");
+        std::fs::write(&a, b"x").unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        copy_to(&b(&a), &b(&dst)).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"x");
+        assert_eq!(std::fs::metadata(&dst).unwrap().modified().unwrap(), old);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_to_copies_tree() {
+        let dir = scratch("cpto-tree");
+        let d = dir.join("d");
+        std::fs::create_dir_all(d.join("e")).unwrap();
+        std::fs::write(d.join("e").join("f"), b"hi").unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        set_mtime(&b(&d), old).unwrap();
+        let d2 = dir.join("d2");
+        copy_to(&b(&d), &b(&d2)).unwrap();
+        assert_eq!(std::fs::read(d2.join("e").join("f")).unwrap(), b"hi");
+        assert_eq!(std::fs::metadata(&d2).unwrap().modified().unwrap(), old);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_to_overwrites_existing_file() {
+        let dir = scratch("cpto-ow");
+        let a = dir.join("a");
+        let dst = dir.join("b");
+        std::fs::write(&a, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+        copy_to(&b(&a), &b(&dst)).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_to_refuses_dir_onto_file() {
+        let dir = scratch("cpto-d2f");
+        let d = dir.join("d");
+        let f = dir.join("f");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(&f, b"old").unwrap();
+        let e = copy_to(&b(&d), &b(&f)).unwrap_err();
+        assert!(platform::is_errno(&e, Errno::Exist), "{e}");
+        assert_eq!(std::fs::read(&f).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_to_into_itself_is_refused() {
+        let dir = scratch("cpto-self");
+        let d = dir.join("d");
+        std::fs::create_dir(&d).unwrap();
+        let e = copy_to(&b(&d), &b(&d.join("sub"))).unwrap_err();
+        assert!(platform::is_errno(&e, Errno::Inval), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

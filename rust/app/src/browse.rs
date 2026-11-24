@@ -2608,7 +2608,11 @@ impl Nnn {
 
         if sel == Action::Rename {
             if ret == i32::from(b'd') {
-                self.spawn(b"cp -rp --", Some(&cn), Some(&tmp), None, F_SILENT);
+                if cfg!(windows) && !crate::platform::has_coreutil(b"cp") {
+                    let _ = crate::winops::copy_to(&cn, &tmp);
+                } else {
+                    self.spawn(b"cp -rp --", Some(&cn), Some(&tmp), None, F_SILENT);
+                }
             } else if std::fs::rename(os(&cn), os(&tmp)).is_err() {
                 return Flow::WarnNochange;
             }

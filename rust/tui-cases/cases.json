@@ -1645,8 +1645,8 @@
     "\\1Size: "
    ],
    [
-    "(Uid|Gid): \\( *\\d+/ *[^) │]*\\)?",
-    "\\1: (<ID>)"
+    "Uid: \\( *\\d+/ *[^)│]*\\)?[^│]*│",
+    "Uid: (<ID>)│"
    ],
    [
     "(Access|Modify): <NOW>:[0-9.]+ [+-]\\d+",
@@ -1691,5 +1691,27 @@
    "g\\.tar"
   ],
   "quiet": 1.5
+ },
+ {
+  "name": "win-duplicate",
+  "platforms": [
+   "windows"
+  ],
+  "env": {
+   "PATH": "C:\\Windows\\System32"
+  },
+  "note": "Recorded on Windows without Git or Coreutils on PATH (hand-verified first run): duplicate copies Gamma to Gamma2 natively.",
+  "args": [],
+  "keys": [
+   "<C-R>",
+   "<Enter>",
+   "<C-U>",
+   "Gamma2",
+   "<Enter>",
+   "q"
+  ],
+  "fixture": {
+   "Gamma": "x\n"
+  }
  }
 ]
