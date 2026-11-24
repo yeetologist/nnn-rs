@@ -5,7 +5,44 @@
 use crate::platform::{self, Errno, FileInfo, path};
 use std::fs;
 use std::io;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// Calls `op` up to `tries` times, sleeping `pause` between tries while `busy(&err)`.
+fn retry_with<T>(
+    mut op: impl FnMut() -> io::Result<T>,
+    busy: fn(&io::Error) -> bool,
+    pause: Duration,
+    tries: usize,
+) -> io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= tries || !busy(&e) {
+                    return Err(e);
+                }
+                std::thread::sleep(pause);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_busy(e: &io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33).
+    matches!(e.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(not(windows))]
+fn is_busy(_e: &io::Error) -> bool {
+    false
+}
+
+fn busy_retry<T>(op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    retry_with(op, is_busy, Duration::from_millis(10), 50)
+}
 
 /// The last component of `p` (trailing `/` ignored).
 fn base(p: &[u8]) -> &[u8] {
@@ -86,12 +123,12 @@ fn copy_entry(src: &[u8], dst: &[u8], ask: &mut dyn FnMut(&[u8]) -> bool) -> io:
             fs::metadata(path(src)).is_ok_and(|m| m.is_dir()),
         );
     }
-    fs::copy(path(src), path(dst))?;
+    busy_retry(|| fs::copy(path(src), path(dst)))?;
     set_mtime(dst, meta.modified()?)
 }
 
 fn set_mtime(p: &[u8], t: SystemTime) -> io::Result<()> {
-    open_for_times(p)?.set_modified(t)
+    busy_retry(|| open_for_times(p))?.set_modified(t)
 }
 
 /// A handle that may set the times of a file or directory (even a read-only one).
@@ -125,7 +162,7 @@ pub fn move_into(
     if fs::symlink_metadata(path(&target)).is_ok() && !ask(base(src)) {
         return Ok(());
     }
-    match fs::rename(path(src), path(&target)) {
+    match busy_retry(|| fs::rename(path(src), path(&target))) {
         Err(e) if e.kind() == io::ErrorKind::CrossesDevices => move_by_copy(src, &target),
         r => r,
     }
@@ -147,11 +184,11 @@ fn move_by_copy(src: &[u8], target: &[u8]) -> io::Result<()> {
 pub fn remove_all(p: &[u8]) -> io::Result<()> {
     let meta = fs::symlink_metadata(path(p))?;
     if meta.is_dir() {
-        fs::remove_dir_all(path(p))
+        busy_retry(|| fs::remove_dir_all(path(p)))
     } else if is_dir_link(&meta) {
-        fs::remove_dir(path(p))
+        busy_retry(|| fs::remove_dir(path(p)))
     } else {
-        fs::remove_file(path(p))
+        busy_retry(|| fs::remove_file(path(p)))
     }
 }
 
@@ -249,7 +286,7 @@ fn remove_interactive(p: &[u8], confirm: &mut dyn FnMut(&[u8]) -> bool) -> io::R
     if !confirm(&rm_question("remove directory", p)) {
         return Ok(false);
     }
-    fs::remove_dir(path(p)).map(|()| true)
+    busy_retry(|| fs::remove_dir(path(p))).map(|()| true)
 }
 
 /// `rm: <what> 'p'?`, quoted as `rm_verbose` quotes.
@@ -593,7 +630,10 @@ mod tests {
             .share_mode(0x1 | 0x2)
             .open(&f)
             .unwrap();
+        let t0 = std::time::Instant::now();
         let e = remove_all(&b(&f)).unwrap_err();
+        let elapsed = t0.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
         let text = crate::sys::strerror(&e);
         assert!(
             text == "Permission denied" || text == "Device or resource busy",
@@ -601,6 +641,148 @@ mod tests {
         );
         assert!(f.exists());
         drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_with_retries_busy_then_succeeds() {
+        let mut calls = 0;
+        let r = retry_with(
+            || {
+                calls += 1;
+                if calls <= 3 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(7)
+                }
+            },
+            |e| e.raw_os_error() == Some(32),
+            Duration::from_millis(1),
+            50,
+        );
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn retry_with_gives_up_after_tries() {
+        let mut calls = 0;
+        let r: io::Result<()> = retry_with(
+            || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(32))
+            },
+            |e| e.raw_os_error() == Some(32),
+            Duration::from_millis(1),
+            5,
+        );
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(32));
+        assert_eq!(calls, 5);
+    }
+
+    #[test]
+    fn retry_with_does_not_retry_other_errors() {
+        let mut calls = 0;
+        let r: io::Result<()> = retry_with(
+            || {
+                calls += 1;
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+            |e| e.raw_os_error() == Some(32),
+            Duration::from_millis(1),
+            50,
+        );
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(calls, 1);
+    }
+
+    #[cfg(windows)]
+    fn hold_briefly(path: PathBuf) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        rx.recv().unwrap();
+        h
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_all_waits_for_brief_lock() {
+        let dir = scratch("rmlock");
+        let f = dir.join("held");
+        std::fs::write(&f, b"x").unwrap();
+        let h = hold_briefly(f.clone());
+        remove_all(&b(&f)).unwrap();
+        h.join().unwrap();
+        assert!(!f.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_into_waits_for_brief_lock() {
+        let dir = scratch("cplock");
+        let f = dir.join("held");
+        std::fs::write(&f, b"hello").unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let h = hold_briefly(f.clone());
+        copy_into(&b(&f), &b(&dir.join("d")), &mut never).unwrap();
+        h.join().unwrap();
+        assert_eq!(std::fs::read(dir.join("d").join("held")).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn move_into_waits_for_brief_lock() {
+        let dir = scratch("mvlock");
+        let f = dir.join("held");
+        std::fs::write(&f, b"moved").unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let h = hold_briefly(f.clone());
+        move_into(&b(&f), &b(&dir.join("d")), &mut never).unwrap();
+        h.join().unwrap();
+        assert!(!f.exists());
+        assert_eq!(std::fs::read(dir.join("d").join("held")).unwrap(), b"moved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_all_removes_read_only_file() {
+        let dir = scratch("rmro");
+        let f = dir.join("ro");
+        std::fs::write(&f, b"x").unwrap();
+        let mut p = std::fs::metadata(&f).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&f, p).unwrap();
+        remove_all(&b(&f)).unwrap();
+        assert!(!f.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_confirmed_force_removes_tree_with_read_only_file() {
+        let dir = scratch("rmrodir");
+        let d = dir.join("t");
+        std::fs::create_dir(&d).unwrap();
+        let f = d.join("ro");
+        std::fs::write(&f, b"x").unwrap();
+        let mut p = std::fs::metadata(&f).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&f, p).unwrap();
+        assert!(remove_confirmed(&b(&d), true, &mut never).unwrap());
+        assert!(!d.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
