@@ -8,6 +8,7 @@
 use crate::browse::{MESSAGES, MSG_FAILED};
 use crate::config::{CMD_LEN_MAX, cstr};
 use crate::keys::Action;
+use crate::platform::path;
 use crate::popup::{F_CHKRTN, F_CLI};
 use crate::state::{NAME_MAX, Nnn, PATH_MAX};
 use std::fs::File;
@@ -30,7 +31,6 @@ const MV: &[u8] = b"mv -i --";
 const PROGRESS_CP: &[u8] = b"cpg -giRp --";
 const PROGRESS_MV: &[u8] = b"mvg -gi --";
 
-use crate::platform::path;
 /// `snprintf(buf, CMD_LEN_MAX, ...)`: the text cut to what fits with its NUL.
 fn cmdbuf(mut v: Vec<u8>) -> Vec<u8> {
     v.truncate(CMD_LEN_MAX - 1);

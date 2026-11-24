@@ -32,12 +32,12 @@ pub fn run(argv: Vec<OsString>) -> u8 {
     if let Err(e) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/null")
+        .open(crate::platform::path(crate::platform::null_device()))
     {
         sys::xerror(10726, &e);
         return 1;
     }
-    if !sys::dir_access(b"/tmp") && std::env::var_os("TMPDIR").is_none() {
+    if crate::platform::temp_dir().is_none() {
         eprintln!("set TMPDIR");
         return 1;
     }
@@ -52,13 +52,7 @@ fn rust_tui(st: Opts, operands: &[Vec<u8>]) -> u8 {
         opts: st.clone(),
         ..Default::default()
     };
-    nnn.g_tmpfpath = if sys::dir_access(b"/tmp") {
-        b"/tmp".to_vec()
-    } else {
-        std::env::var_os("TMPDIR")
-            .map(crate::platform::into_bytes)
-            .unwrap_or_default()
-    };
+    nnn.g_tmpfpath = crate::platform::temp_dir().unwrap_or_default();
     if !nnn.list_mode_main() {
         cleanup(&st);
         return 1;

@@ -18,6 +18,7 @@ use crate::curses::{
 use crate::fmt;
 use crate::keys::{Action, BINDINGS};
 use crate::locale;
+use crate::platform;
 use crate::sort::{
     self, DIR_OR_DIRLNK, Entry, FILE_MISSING, FILE_SELECTED, FILE_YOUNG, HARD_LINK, SYM_ORPHAN,
 };
@@ -859,10 +860,10 @@ impl Nnn {
             w.addstr(perms.as_bytes());
             w.addch(' ');
             if self.g_state.uidgid {
-                let u =
-                    locale::pw_name(pent.uid).unwrap_or_else(|| pent.uid.to_string().into_bytes());
-                let g =
-                    locale::gr_name(pent.gid).unwrap_or_else(|| pent.gid.to_string().into_bytes());
+                let u = platform::user_name(pent.uid)
+                    .unwrap_or_else(|| pent.uid.to_string().into_bytes());
+                let g = platform::group_name(pent.gid)
+                    .unwrap_or_else(|| pent.gid.to_string().into_bytes());
                 let w = self.w();
                 w.addstr(&u);
                 w.addch(':');
@@ -871,12 +872,9 @@ impl Nnn {
             }
             if pent.mode & S_IFMT == S_IFLNK {
                 if !self.cfg.fileinfo {
-                    let link = rustix::fs::readlink(&*crate::platform::os(&pent.name), Vec::new());
+                    let link = platform::readlink(&pent.name);
                     let (i, target) = match link {
-                        Ok(t) => {
-                            let b = t.into_bytes();
-                            (b.len().min(PATH_MAX) as i64, b)
-                        }
+                        Ok(b) => (b.len().min(PATH_MAX) as i64, b),
                         Err(_) => (-1, Vec::new()),
                     };
                     self.w()
@@ -894,9 +892,9 @@ impl Nnn {
                 w.addch(' ');
                 w.addstr(&ext);
                 if pent.flags & HARD_LINK != 0
-                    && let Ok(sb) = rustix::fs::stat(&*crate::platform::os(&pent.name))
+                    && let Ok(sb) = platform::stat(&pent.name, true)
                 {
-                    let s = format!(" {}-{}", sb.st_nlink as i32 as u32, sb.st_ino as i32 as u32);
+                    let s = format!(" {}-{}", sb.nlink as i32 as u32, sb.ino as i32 as u32);
                     let mut parts = s.splitn(2, '-');
                     let (a, b) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
                     let w = self.w();

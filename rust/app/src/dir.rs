@@ -1,12 +1,10 @@
 //! Reading a directory into entries (`dentfill`); disk-usage mode plugs in through
 //! [`DuHook`] (du.rs).
 
+use crate::platform::{DType, Dir, FileInfo};
 use crate::sort::{
     DIR_OR_DIRLNK, Entry, FILE_MISSING, FILE_YOUNG, HARD_LINK, SYM_ORPHAN, TimeType,
 };
-use rustix::fd::{AsFd, BorrowedFd};
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
-use std::ffi::CStr;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFLNK: u32 = 0o120000;
@@ -26,66 +24,26 @@ pub struct FillCfg {
     pub listpath: bool,
 }
 
-/// The `struct stat` fields `dentfill` uses; all zero for a missing file (the original's
-/// memset).
-#[derive(Default, Clone, Copy)]
-struct Info {
-    mode: u32,
-    size: i64,
-    nlink: u64,
-    uid: u32,
-    gid: u32,
-    times: [(i64, u32); 3],
-}
-
-impl Info {
-    fn of(sb: &Stat) -> Info {
-        Info {
-            mode: sb.st_mode,
-            size: sb.st_size,
-            nlink: sb.st_nlink,
-            uid: sb.st_uid,
-            gid: sb.st_gid,
-            times: [
-                (sb.st_atime, sb.st_atime_nsec as u32),
-                (sb.st_ctime, sb.st_ctime_nsec as u32),
-                (sb.st_mtime, sb.st_mtime_nsec as u32),
-            ],
-        }
-    }
-
+impl FileInfo {
     fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
     }
 }
 
-fn raw_stat(dir: &impl AsFd, name: &CStr, follow: bool) -> Option<Stat> {
-    let at = if follow {
-        AtFlags::empty()
-    } else {
-        AtFlags::SYMLINK_NOFOLLOW
-    };
-    rustix::fs::statat(dir, name, at).ok()
-}
-
-fn stat(dir: &impl AsFd, name: &CStr, follow: bool) -> Option<Info> {
-    raw_stat(dir, name, follow).map(|sb| Info::of(&sb))
-}
-
 /// dentfill's `cfg.blkorder` branches (implemented in du.rs).
 pub trait DuHook {
     /// Setup after the directory is opened; false goes straight to `exit:`.
-    fn begin(&mut self, fd: BorrowedFd<'_>, path: &[u8]) -> bool;
+    fn begin(&mut self, dir: &Dir, path: &[u8]) -> bool;
     /// A hidden entry while hidden files are not shown; false stops reading.
-    fn hidden(&mut self, fd: BorrowedFd<'_>, path: &[u8], name: &CStr) -> bool;
+    fn hidden(&mut self, dir: &Dir, path: &[u8], name: &[u8]) -> bool;
     /// An entry about to be added at `idx` (`sb` None: missing file); sets its `blocks`;
     /// false stops reading without adding it.
     fn entry(
         &mut self,
-        fd: BorrowedFd<'_>,
+        dir: &Dir,
         path: &[u8],
-        name: &CStr,
-        sb: Option<&Stat>,
+        name: &[u8],
+        sb: Option<&FileInfo>,
         idx: usize,
         blocks: &mut u64,
     ) -> bool;
@@ -103,28 +61,25 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let Ok(fd) = rustix::fs::open(&*crate::platform::os(path), flags, Mode::empty()) else {
+    let Ok(dir) = Dir::open(path) else {
         return Vec::new();
     };
-    let Ok(dir) = Dir::read_from(&fd) else {
+    let Ok(entries) = dir.entries() else {
         return Vec::new();
     };
     let mut out = Vec::new();
     if let Some(h) = du.as_deref_mut()
-        && !h.begin(fd.as_fd(), path)
+        && !h.begin(&dir, path)
     {
         h.finish(&mut out);
         return out;
     }
     let mut nofollow: Option<bool> = None;
-    for dp in dir {
-        let Ok(dp) = dp else { break };
-        let cname = dp.file_name();
-        let name = cname.to_bytes();
-        let d_type = dp.file_type();
+    for dp in entries {
+        let Ok((name, d_type)) = dp else { break };
+        let name = name.as_slice();
         // Decided on the first entry read, as the original does.
-        let nofollow = *nofollow.get_or_insert(du.is_some() || d_type == FileType::Unknown);
+        let nofollow = *nofollow.get_or_insert(du.is_some() || d_type == DType::Unknown);
         if selforparent(name) {
             continue;
         }
@@ -132,31 +87,31 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
             match du.as_deref_mut() {
                 None => continue,
                 Some(h) => {
-                    if h.hidden(fd.as_fd(), path, cname) {
+                    if h.hidden(&dir, path, name) {
                         continue;
                     }
                     break;
                 }
             }
         }
-        let (raw, mut entflags) = match raw_stat(&fd, cname, !nofollow) {
-            Some(sb) => (Some(sb), 0),
-            None if nofollow => (None, FILE_MISSING),
-            None => match raw_stat(&fd, cname, false) {
-                Some(sb) => (Some(sb), SYM_ORPHAN),
-                None => (None, FILE_MISSING),
+        let (raw, mut entflags) = match dir.stat_at(name, !nofollow) {
+            Ok(sb) => (Some(sb), 0),
+            Err(_) if nofollow => (None, FILE_MISSING),
+            Err(_) => match dir.stat_at(name, false) {
+                Ok(sb) => (Some(sb), SYM_ORPHAN),
+                Err(_) => (None, FILE_MISSING),
             },
         };
-        let sb = raw.as_ref().map(Info::of).unwrap_or_default();
-        let (sec, nsec) = sb.times[match cfg.timetype {
-            TimeType::Access => 0,
-            TimeType::Change => 1,
-            TimeType::Mod => 2,
-        }];
-        if now - sb.times[2].0 <= 300 || now - sb.times[1].0 <= 300 {
+        let sb = raw.unwrap_or_default();
+        let (sec, nsec) = match cfg.timetype {
+            TimeType::Access => sb.atime,
+            TimeType::Change => sb.ctime,
+            TimeType::Mod => sb.mtime,
+        };
+        if now - sb.mtime.0 <= 300 || now - sb.ctime.0 <= 300 {
             entflags |= FILE_YOUNG;
         }
-        let (mode, size) = if !nofollow && d_type == FileType::Symlink {
+        let (mode, size) = if !nofollow && d_type == DType::Symlink {
             (
                 (sb.mode & !S_IFMT) | S_IFLNK,
                 if cfg.listpath { sb.size } else { 0 },
@@ -166,14 +121,7 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
         };
         let mut blocks = 0;
         if let Some(h) = du.as_deref_mut()
-            && !h.entry(
-                fd.as_fd(),
-                path,
-                cname,
-                raw.as_ref(),
-                out.len(),
-                &mut blocks,
-            )
+            && !h.entry(&dir, path, name, raw.as_ref(), out.len(), &mut blocks)
         {
             break;
         }
@@ -185,13 +133,13 @@ pub fn dentfill_with(path: &[u8], cfg: FillCfg, mut du: Option<&mut dyn DuHook>)
         flags |= entflags;
         let target_is_dir = if nofollow {
             if sb.mode & S_IFMT == S_IFLNK {
-                stat(&fd, cname, true).is_some_and(|t| t.is_dir())
+                dir.stat_at(name, true).is_ok_and(|t| t.is_dir())
             } else {
                 sb.is_dir()
             }
         } else {
-            d_type == FileType::Directory
-                || ((d_type == FileType::Symlink || d_type == FileType::Unknown) && sb.is_dir())
+            d_type == DType::Dir
+                || ((d_type == DType::Symlink || d_type == DType::Unknown) && sb.is_dir())
         };
         if target_is_dir {
             flags |= DIR_OR_DIRLNK;

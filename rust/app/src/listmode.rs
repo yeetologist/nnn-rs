@@ -4,6 +4,7 @@
 
 use crate::curses::color_pair;
 use crate::dir::selforparent;
+use crate::platform::{self, Os, path};
 use crate::state::{Nnn, PATH_MAX};
 use crate::sys;
 use rustix::fd::{AsFd, BorrowedFd};
@@ -20,8 +21,6 @@ pub const LIST_INPUT_MAX: usize = LIST_FILES_MAX * PATH_MAX;
 const CHUNK: usize = 512 * 1024;
 /// \`XDELAY_INTERVAL_MS\` (in microseconds, as the original uses it).
 const XDELAY_INTERVAL_MS: u64 = 350_000;
-/// \`ctermid(NULL)\` on glibc.
-const CTERMID: &str = "/dev/tty";
 /// \`utils[UTIL_RM_RF]\`
 const UTIL_RM_RF: [&str; 2] = ["rm", "-rf"];
 
@@ -36,7 +35,6 @@ pub const MSG_SIZE_LIMIT: &[u8] = b"size limit exceeded";
 #[derive(Debug, Default)]
 pub struct ListState {}
 
-use crate::platform::path;
 /// \`xmemrchr\`: index of the last \`ch\` in \`s\`.
 fn xmemrchr(s: &[u8], ch: u8) -> Option<usize> {
     s.iter().rposition(|&c| c == ch)
@@ -54,6 +52,11 @@ fn xdirname(p: &[u8]) -> &[u8] {
 /// \`common_prefix\`: shortens \`prefix\` to the directory prefix it shares with \`path\` (sets it
 /// to \`path\` when empty). False where the original returns NULL (empty \`path\`).
 fn common_prefix(path: &[u8], prefix: &mut Vec<u8>) -> bool {
+    common_prefix_with(Os::CURRENT, path, prefix)
+}
+
+/// \`common_prefix\` for the path forms of \`os\`.
+fn common_prefix_with(os: Os, path: &[u8], prefix: &mut Vec<u8>) -> bool {
     if path.is_empty() {
         return false;
     }
@@ -84,7 +87,7 @@ fn common_prefix(path: &[u8], prefix: &mut Vec<u8>) -> bool {
     }
     // Shorten prefix
     prefix.truncate(n);
-    let root = crate::platform::root_len(path).max(1);
+    let root = platform::root_len_with(os, path).max(1);
     match xmemrchr(prefix, b'/') {
         Some(sep) => prefix.truncate(sep.max(root)),
         None => prefix.truncate(root), // Just the root
@@ -193,9 +196,10 @@ impl Nnn {
         self.listpath = Some(tmpdir.clone());
 
         for p in paths.iter().flatten() {
-            if let Err(rustix::io::Errno::NOENT) = rustix::fs::stat(&*path(p)) {
-                continue;
-            }
+            let info = match platform::stat(p, true) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                other => other.ok(),
+            };
 
             // Don't copy the common prefix
             tmpdir.truncate(tmp);
@@ -209,7 +213,8 @@ impl Nnn {
                 xmktree(dir);
             }
 
-            let _ = std::os::unix::fs::symlink(path(p), path(&tmpdir));
+            let is_dir = info.is_some_and(|i| i.mode & 0o170000 == 0o040000);
+            let _ = platform::symlink(p, &tmpdir, is_dir);
         }
 
         // Get the dir in which to start
@@ -363,7 +368,11 @@ impl Nnn {
         // We return to tty
         let stdout = rustix::stdio::stdout();
         if !rustix::termios::isatty(stdout) {
-            if let Ok(fd) = rustix::fs::open(CTERMID, OFlags::RDONLY, Mode::from_raw_mode(0o400)) {
+            if let Ok(fd) = rustix::fs::open(
+                &*platform::os(platform::tty_device()),
+                OFlags::RDONLY,
+                Mode::from_raw_mode(0o400),
+            ) {
                 let _ = rustix::stdio::dup2_stdin(fd.as_fd());
             }
         } else {
@@ -398,6 +407,18 @@ mod tests {
         common_prefix(b"/ac", &mut p);
         assert_eq!(p, b"/");
         assert!(!common_prefix(b"", &mut p));
+    }
+
+    #[test]
+    fn prefix_windows_roots() {
+        let mut p = b"C:/a/b".to_vec();
+        assert!(common_prefix_with(Os::Windows, b"C:/a/c", &mut p));
+        assert_eq!(p, b"C:/a");
+        assert!(common_prefix_with(Os::Windows, b"C:/b", &mut p));
+        assert_eq!(p, b"C:/");
+        let mut p = b"//srv/share/a".to_vec();
+        assert!(common_prefix_with(Os::Windows, b"//srv/share/b", &mut p));
+        assert_eq!(p, b"//srv/share/");
     }
 
     #[test]

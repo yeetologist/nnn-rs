@@ -5,6 +5,8 @@
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -112,6 +114,97 @@ pub fn xdirname(p: &[u8]) -> &[u8] {
     xdirname_with(Os::CURRENT, p)
 }
 
+/// The `struct stat` fields nnn uses. On Windows `mode` is synthesized, `uid` and `gid` are 0,
+/// `dev` is the volume serial number and `ino` the file index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileInfo {
+    pub mode: u32,
+    pub size: i64,
+    pub nlink: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub ino: u64,
+    pub dev: u64,
+    pub blocks512: u64,
+    pub atime: (i64, u32),
+    pub ctime: (i64, u32),
+    pub mtime: (i64, u32),
+}
+
+/// A directory entry's type as the directory listing gives it (`d_type`); `Unknown` means the
+/// type needs a `stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DType {
+    Dir,
+    Symlink,
+    Regular,
+    Unknown,
+    Other,
+}
+
+pub use backend::{Dir, Entries};
+
+/// `stat` (`follow`) or `lstat` of a byte path.
+pub fn stat(path: &[u8], follow: bool) -> io::Result<FileInfo> {
+    backend::stat(path, follow)
+}
+
+/// The entries of a directory, without `.` and `..`.
+pub fn read_dir(path: &[u8]) -> io::Result<Entries> {
+    Dir::open(path)?.entries()
+}
+
+/// The target a symbolic link holds.
+pub fn readlink(path: &[u8]) -> io::Result<Vec<u8>> {
+    backend::readlink(path)
+}
+
+/// Makes `link` a symbolic link to `target` (`is_dir`: the target is a directory; only Windows
+/// needs to know).
+pub fn symlink(target: &[u8], link: &[u8], is_dir: bool) -> io::Result<()> {
+    backend::symlink(target, link, is_dir)
+}
+
+/// The null device: `/dev/null` or `NUL`.
+pub fn null_device() -> &'static [u8] {
+    backend::NULL_DEVICE
+}
+
+/// The controlling terminal: `/dev/tty` or `CONIN$`.
+pub fn tty_device() -> &'static [u8] {
+    backend::TTY_DEVICE
+}
+
+/// The directory for temporary files, if there is one.
+pub fn temp_dir() -> Option<Vec<u8>> {
+    backend::temp_dir()
+}
+
+/// The user's home directory.
+pub fn home() -> Option<Vec<u8>> {
+    backend::home()
+}
+
+/// The name of user `uid` (none on Windows).
+pub fn user_name(uid: u32) -> Option<Vec<u8>> {
+    backend::user_name(uid)
+}
+
+/// The name of group `gid` (none on Windows).
+pub fn group_name(gid: u32) -> Option<Vec<u8>> {
+    backend::group_name(gid)
+}
+
+/// Opens files created by `create_file` private to the user where the OS has such modes.
+pub fn private_mode(o: &mut OpenOptions) -> &mut OpenOptions {
+    backend::private_mode(o)
+}
+
+/// Raises the soft limit on open files to the hard limit (a no-op on Windows).
+pub fn raise_open_files_limit() {
+    backend::raise_open_files_limit();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +256,170 @@ mod tests {
     fn os_and_bytes_round_trip() {
         let p = b"dir/na\xC3\xA9me";
         assert_eq!(&*bytes(&os(p)), p);
+    }
+
+    /// A fresh temp dir holding the directory `d` and the 3-byte file `f`.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nnn-platform-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("f"), b"abc").unwrap();
+        dir
+    }
+
+    fn join(dir: &Path, name: &str) -> Vec<u8> {
+        let mut b = bytes(dir.as_os_str()).into_owned();
+        b.push(b'/');
+        b.extend_from_slice(name.as_bytes());
+        b
+    }
+
+    #[test]
+    fn stat_dir_and_file_modes() {
+        let dir = scratch("modes");
+        let d = stat(&join(&dir, "d"), true).unwrap();
+        assert_eq!(d.mode & 0o170000, 0o040000);
+        let f = stat(&join(&dir, "f"), true).unwrap();
+        assert_eq!(f.mode & 0o170000, 0o100000);
+        assert_eq!(f.size, 3);
+        assert!(f.nlink >= 1);
+        assert!(stat(&join(&dir, "missing"), true).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_dir_reports_types() {
+        let dir = scratch("readdir");
+        let mut names = Vec::new();
+        for e in read_dir(&bytes(dir.as_os_str())).unwrap() {
+            let (name, ty) = e.unwrap();
+            match name.as_slice() {
+                b"d" => assert_eq!(ty, DType::Dir),
+                b"f" => assert!(matches!(ty, DType::Regular | DType::Unknown)),
+                other => panic!("unexpected entry {other:?}"),
+            }
+            names.push(name);
+        }
+        names.sort();
+        assert_eq!(names, [b"d".to_vec(), b"f".to_vec()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_handle_stats_names_inside() {
+        let dir = scratch("dirat");
+        let h = Dir::open(&bytes(dir.as_os_str())).unwrap();
+        assert_eq!(h.stat_at(b"f", true).unwrap().size, 3);
+        assert!(h.stat_at(b"nope", false).is_err());
+        let names: Vec<_> = h.entries().unwrap().map(|e| e.unwrap().0).collect();
+        assert_eq!(names.len(), 2);
+        assert!(Dir::open(&join(&dir, "f")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn devices_home_and_temp() {
+        assert_eq!(
+            null_device(),
+            if cfg!(windows) {
+                &b"NUL"[..]
+            } else {
+                b"/dev/null"
+            }
+        );
+        assert_eq!(
+            tty_device(),
+            if cfg!(windows) {
+                &b"CONIN$"[..]
+            } else {
+                b"/dev/tty"
+            }
+        );
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(os(null_device()))
+                .is_ok()
+        );
+        assert!(temp_dir().is_some_and(|t| !t.is_empty()));
+        if std::env::var_os("HOME").is_some() {
+            assert_eq!(home(), std::env::var_os("HOME").map(into_bytes));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_round_trip_and_nofollow() {
+        let dir = scratch("link");
+        let link = join(&dir, "l");
+        symlink(b"f", &link, false).unwrap();
+        assert_eq!(readlink(&link).unwrap(), b"f");
+        assert_eq!(stat(&link, false).unwrap().mode & 0o170000, 0o120000);
+        assert_eq!(stat(&link, true).unwrap().mode & 0o170000, 0o100000);
+        let names: Vec<_> = read_dir(&bytes(dir.as_os_str()))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert!(names.contains(&(b"l".to_vec(), DType::Symlink)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn symlink_round_trip_when_allowed() {
+        let dir = scratch("link");
+        let link = join(&dir, "l");
+        if let Err(e) = symlink(b"f", &link, false) {
+            // Creating links needs a privilege (or Developer Mode) that a plain account lacks.
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            return;
+        }
+        assert_eq!(readlink(&link).unwrap(), b"f");
+        assert_eq!(stat(&link, false).unwrap().mode, 0o120777);
+        assert_eq!(stat(&link, true).unwrap().mode & 0o170000, 0o100000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_and_group_names() {
+        assert_eq!(user_name(0), Some(b"root".to_vec()));
+        assert!(group_name(0).is_some());
+        assert_eq!(user_name(4_000_000_000), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_has_no_user_names() {
+        assert_eq!(user_name(0), None);
+        assert_eq!(group_name(0), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wtf8_round_trip_unpaired_surrogate() {
+        use std::os::windows::ffi::OsStringExt;
+        let dir = scratch("wtf8");
+        let name = std::ffi::OsString::from_wide(&[0x61, 0xD800]);
+        std::fs::write(dir.join(&name), b"x").unwrap();
+        let listed = read_dir(&bytes(dir.as_os_str()))
+            .unwrap()
+            .map(|e| e.unwrap().0)
+            .find(|n| n.starts_with(b"a"))
+            .unwrap();
+        let mut from = bytes(dir.as_os_str()).into_owned();
+        from.push(b'/');
+        from.extend_from_slice(&listed);
+        let to = join(&dir, "renamed");
+        std::fs::rename(&*os(&from), &*os(&to)).unwrap();
+        assert!(dir.join("renamed").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strerror_uses_glibc_words() {
+        let e = std::fs::File::open("C:/no/such/file").unwrap_err();
+        assert_eq!(crate::sys::strerror(&e), "No such file or directory");
     }
 }

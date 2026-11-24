@@ -9,6 +9,7 @@ use crate::browse::{MESSAGES, MSG_FAILED, xdiraccess};
 use crate::config::{
     TOK_MNT, TOKS, cstr, is_prefix, is_suffix, mkpath, xbasename, xdirname, xmktree_io,
 };
+use crate::platform::path;
 use crate::popup::{F_CLI, F_CONFIRM, F_MULTI, F_NORMAL, F_NOTRACE, F_NOWAIT, xgetenv};
 use crate::prompt::{MSGWAIT, XDELAY_INTERVAL_MS, xconfirm};
 use crate::state::{Nnn, PATH_MAX};
@@ -40,7 +41,6 @@ const ARCHIVE_CMD: [&[u8]; 4] = [b"atool -a", b"bsdtar -acvf", b"zip -r", b"tar 
 /// The static `found` of `unmount`: "fusermount3" was not found, "fusermount" is used.
 static FUSERMOUNT_OLD: AtomicBool = AtomicBool::new(false);
 
-use crate::platform::path;
 /// `shell_escape` with a dynamic buffer (it cannot fail but for memory): `'...'` with each
 /// `'` written as `'\\''`.
 fn shell_escape(inbuf: &[u8]) -> Vec<u8> {

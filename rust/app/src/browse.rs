@@ -606,7 +606,7 @@ impl Nnn {
             self.popup.curssn.clear();
         }
 
-        let Some(home) = getenv("HOME") else {
+        let Some(home) = crate::platform::home() else {
             msg(b"set HOME");
             return 1;
         };

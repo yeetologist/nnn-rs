@@ -2,6 +2,7 @@
 //! write_lastdir, and the path helpers of src/nnn.c (mkpath, xdirname, xbasename,
 //! common_prefix, get_cwd_entry, is_suffix, is_prefix).
 
+use crate::platform::{self, Os, path};
 use crate::state::{Kv, Nnn, PATH_MAX};
 use crate::sys;
 use std::fs::{DirBuilder, OpenOptions};
@@ -35,7 +36,6 @@ const MSG_BM_NAME: &[u8] = b"name: ";
 /// The maximum number of key-value pairs parsekvpair reads.
 const KV_MAX: usize = 100;
 
-use crate::platform::path;
 /// The C string in `s`: the bytes before the first NUL.
 pub fn cstr(s: &[u8]) -> &[u8] {
     s.iter().position(|&c| c == 0).map_or(s, |at| &s[..at])
@@ -176,6 +176,11 @@ pub fn mkpath(dir: &[u8], name: &[u8], home: &[u8]) -> (Vec<u8>, usize) {
 /// whole `path` is copied here. A prefix with no '/' before the mismatch makes the original
 /// dereference NULL; here it becomes empty.
 pub fn common_prefix(p: &[u8], prefix: &mut Vec<u8>) -> bool {
+    common_prefix_with(Os::CURRENT, p, prefix)
+}
+
+/// `common_prefix` for the path forms of `os`.
+pub fn common_prefix_with(os: Os, p: &[u8], prefix: &mut Vec<u8>) -> bool {
     let p = cstr(p);
     if p.is_empty() {
         return false;
@@ -205,7 +210,7 @@ pub fn common_prefix(p: &[u8], prefix: &mut Vec<u8>) -> bool {
     }
     let mut pre = pre;
     pre.truncate(i);
-    let root = crate::platform::root_len(p);
+    let root = platform::root_len_with(os, p);
     match xmemrchr(&pre, b'/', i) {
         Some(at) => pre.truncate(at.max(root)),
         None => pre.clear(),
@@ -216,8 +221,7 @@ pub fn common_prefix(p: &[u8], prefix: &mut Vec<u8>) -> bool {
 
 /// `bmtarget`: the absolute path of the link `filepath` points to, taking `cwd` into account.
 pub fn bmtarget(filepath: &[u8], cwd: &[u8], home: &[u8]) -> Option<Vec<u8>> {
-    let target = std::fs::read_link(path(filepath)).ok()?;
-    let target = crate::platform::bytes(target.as_os_str());
+    let target = platform::readlink(filepath).ok()?;
     let target = &target[..target.len().min(PATH_MAX)];
     sys::abspath_in(cstr(target), Some(cwd), Some(home))
 }
@@ -486,7 +490,8 @@ impl Nnn {
                 buf[r - 1] = b'/';
                 xstrsncpy(&mut buf[r..], &name, PATH_MAX - r);
                 *newpath = cstr(&buf).to_vec();
-                let msg = match std::os::unix::fs::symlink(path(p), path(newpath)) {
+                let is_dir = platform::stat(p, true).is_ok_and(|i| i.mode & 0o170000 == 0o040000);
+                let msg = match platform::symlink(p, newpath, is_dir) {
                     Err(e) => sys::strerror(&e).into_bytes(),
                     Ok(()) => newpath.clone(),
                 };
@@ -630,6 +635,14 @@ mod tests {
         assert_eq!(p, b"/q");
         assert!(!common_prefix(b"", &mut p));
         assert_eq!(get_cwd_entry(b"/a", b"/a/bc/d"), Some((3, 2)));
+        let mut p = b"C:/a/b".to_vec();
+        assert!(common_prefix_with(Os::Windows, b"C:/a/c", &mut p));
+        assert_eq!(p, b"C:/a");
+        assert!(common_prefix_with(Os::Windows, b"C:/b", &mut p));
+        assert_eq!(p, b"C:/");
+        let mut p = b"//srv/share/a".to_vec();
+        assert!(common_prefix_with(Os::Windows, b"//srv/share/b", &mut p));
+        assert_eq!(p, b"//srv/share/");
         assert_eq!(get_cwd_entry(b"/a", b"/b/c"), None);
         assert!(is_suffix(b"abc", b"bc"));
         assert!(!is_suffix(b"c", b"bc"));

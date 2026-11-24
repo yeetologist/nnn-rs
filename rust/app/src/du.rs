@@ -8,11 +8,9 @@
 
 use crate::config::mkpath;
 use crate::dir::DuHook;
+use crate::platform::{self, DType, Dir, FileInfo};
 use crate::sort::Entry;
 use crate::state::Nnn;
-use rustix::fd::{AsFd, BorrowedFd};
-use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
-use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -213,18 +211,18 @@ fn du_queue_task(
 }
 
 /// `add_blocks`
-fn add_blocks(sh: &Shared, tblocks: &mut i64, sb: &Stat) {
+fn add_blocks(sh: &Shared, tblocks: &mut i64, sb: &FileInfo) {
     if sh.apparentsz.load(Ordering::Relaxed) {
-        *tblocks += sb.st_size;
-    } else if sb.st_blocks != 0 {
-        *tblocks += sb.st_blocks;
+        *tblocks += sb.size;
+    } else if sb.blocks512 != 0 {
+        *tblocks += sb.blocks512 as i64;
     }
 }
 
 /// `lazy_stat`
-fn lazy_stat(fd: BorrowedFd<'_>, name: &CStr, sb: &mut Option<Stat>) -> bool {
+fn lazy_stat(dir: &Dir, name: &[u8], sb: &mut Option<FileInfo>) -> bool {
     if sb.is_none() {
-        match rustix::fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        match dir.stat_at(name, false) {
             Ok(s) => *sb = Some(s),
             Err(_) => return false,
         }
@@ -241,75 +239,68 @@ fn du_walk_dir(
     tfiles: &mut u64,
     tblocks: &mut i64,
 ) {
-    let Ok(sb_root) =
-        rustix::fs::statat(CWD, &*crate::platform::os(root), AtFlags::SYMLINK_NOFOLLOW)
-    else {
+    let Ok(sb_root) = platform::stat(root, false) else {
         return;
     };
-    if !is_dir(sb_root.st_mode) {
+    if !is_dir(sb_root.mode) {
         return;
     }
-    let root_dev = sb_root.st_dev;
+    let root_dev = sb_root.dev;
     if count_root {
         add_blocks(sh, tblocks, &sb_root);
         *tfiles += 1;
     }
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let Ok(fd) = rustix::fs::open(&*crate::platform::os(root), flags, Mode::empty()) else {
+    let Ok(dfd) = Dir::open(root) else {
         return;
     };
-    let Ok(dir) = Dir::read_from(&fd) else {
+    let Ok(entries) = dfd.entries() else {
         return;
     };
-    let dfd = fd.as_fd();
-    for dp in dir {
-        let Ok(dp) = dp else { break };
+    for dp in entries {
+        let Ok((name, dtype)) = dp else { break };
         if sh.interrupt.load(Ordering::Relaxed) {
             break;
         }
-        let name = dp.file_name();
-        if crate::dir::selforparent(name.to_bytes()) {
+        let name = name.as_slice();
+        if crate::dir::selforparent(name) {
             continue;
         }
-        let dtype = dp.file_type();
-        let mut isdir = dtype == FileType::Directory;
-        let mut isreg = dtype == FileType::RegularFile;
-        let mut sb: Option<Stat> = None;
-        if dtype == FileType::Unknown {
-            let Ok(s) = rustix::fs::statat(dfd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        let mut isdir = dtype == DType::Dir;
+        let mut isreg = dtype == DType::Regular;
+        let mut sb: Option<FileInfo> = None;
+        if dtype == DType::Unknown {
+            let Ok(s) = dfd.stat_at(name, false) else {
                 continue;
             };
-            isdir = is_dir(s.st_mode);
-            isreg = is_reg(s.st_mode);
+            isdir = is_dir(s.mode);
+            isreg = is_reg(s.mode);
             sb = Some(s);
         }
         if isdir {
-            if !lazy_stat(dfd, name, &mut sb) {
+            if !lazy_stat(&dfd, name, &mut sb) {
                 continue;
             }
             if let Some(s) = &sb {
                 add_blocks(sh, tblocks, s);
             }
         } else if isreg {
-            if !lazy_stat(dfd, name, &mut sb) {
+            if !lazy_stat(&dfd, name, &mut sb) {
                 continue;
             }
             if let Some(s) = &sb {
                 // Do not recount hard links
-                if s.st_size != 0
-                    && (s.st_nlink <= 1 || test_set_bit(&sh.ihashbmp, s.st_ino as u32))
-                {
+                if s.size != 0 && (s.nlink <= 1 || test_set_bit(&sh.ihashbmp, s.ino as u32)) {
                     add_blocks(sh, tblocks, s);
                 }
             }
         }
         *tfiles += 1;
         if isdir {
-            if !lazy_stat(dfd, name, &mut sb) {
+            if !lazy_stat(&dfd, name, &mut sb) {
                 continue;
             }
-            if sb.as_ref().is_some_and(|s| s.st_dev == root_dev) {
-                let (child, _) = mkpath(root, name.to_bytes(), &sh.home);
+            if sb.as_ref().is_some_and(|s| s.dev == root_dev) {
+                let (child, _) = mkpath(root, name, &sh.home);
                 du_queue_task(sh, &child, group, false, true);
             }
         }
@@ -373,21 +364,6 @@ fn du_worker_loop(sh: Arc<Shared>, core: usize) {
             q.pending -= 1;
         }
         sh.du_cond.notify_one();
-    }
-}
-
-/// `max_openfds`: raise the soft limit on open files to the hard limit.
-fn max_openfds() {
-    use rustix::process::{Resource, getrlimit, setrlimit};
-    let mut rl = getrlimit(Resource::Nofile);
-    let below = match (rl.current, rl.maximum) {
-        (Some(cur), Some(max)) => cur < max,
-        (Some(_), None) => true,
-        _ => false,
-    };
-    if below {
-        rl.current = rl.maximum;
-        let _ = setrlimit(Resource::Nofile, rl);
     }
 }
 
@@ -490,7 +466,7 @@ impl Nnn {
                     }
                 }
             }
-            max_openfds();
+            platform::raise_open_files_limit();
             self.g_state.duinit = true;
         } else {
             {
@@ -516,16 +492,15 @@ impl Nnn {
 
 impl DuHook for DuFill<'_> {
     /// dentfill's setup when `cfg.blkorder` is set (7316-7343).
-    fn begin(&mut self, fd: BorrowedFd<'_>, path: &[u8]) -> bool {
+    fn begin(&mut self, dir: &Dir, path: &[u8]) -> bool {
         let n = &mut *self.nnn;
         n.du.first_call = true;
         n.num_files = 0;
         n.dir_blocks = 0;
-        let Ok(sb_path) = rustix::fs::statat(fd, &*crate::platform::os(path), AtFlags::empty())
-        else {
+        let Ok(sb_path) = dir.stat_at(path, true) else {
             return false;
         };
-        self.path_dev = sb_path.st_dev;
+        self.path_dev = sb_path.dev;
         match &n.du.shared {
             Some(sh) => sh
                 .ihashbmp
@@ -563,23 +538,22 @@ impl DuHook for DuFill<'_> {
     }
 
     /// A hidden entry while hidden files are not shown (7374-7407); false to stop (interrupt).
-    fn hidden(&mut self, fd: BorrowedFd<'_>, path: &[u8], name: &CStr) -> bool {
-        let Ok(sb) = rustix::fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+    fn hidden(&mut self, dir: &Dir, path: &[u8], name: &[u8]) -> bool {
+        let Ok(sb) = dir.stat_at(name, false) else {
             return true;
         };
         // Use resolved (dev,ino) for duplicate check (symlink-to-dir vs real dir)
-        let resolved = if is_lnk(sb.st_mode) {
-            rustix::fs::statat(fd, name, AtFlags::empty()).ok()
+        let resolved = if is_lnk(sb.mode) {
+            dir.stat_at(name, true).ok()
         } else {
             Some(sb)
         };
         let n = &mut *self.nnn;
-        match resolved.filter(|s| is_dir(s.st_mode)) {
+        match resolved.filter(|s| is_dir(s.mode)) {
             Some(sd) => {
-                if self.path_dev == sd.st_dev {
-                    let (buf, _) = mkpath(path, name.to_bytes(), &n.home);
-                    let first =
-                        test_set_bit_dir(&mut n.du.dir_dispatched_bmp, sd.st_dev, sd.st_ino);
+                if self.path_dev == sd.dev {
+                    let (buf, _) = mkpath(path, name, &n.home);
+                    let first = test_set_bit_dir(&mut n.du.dir_dispatched_bmp, sd.dev, sd.ino);
                     n.dirwalk(&buf, -1, false, !first);
                     if n.du_interrupted() {
                         return false;
@@ -588,14 +562,11 @@ impl DuHook for DuFill<'_> {
                 n.num_files += 1;
             }
             None => {
-                if sb.st_size != 0
-                    && is_reg(sb.st_mode)
-                    && (sb.st_nlink <= 1 || n.ihash_set(sb.st_ino))
-                {
+                if sb.size != 0 && is_reg(sb.mode) && (sb.nlink <= 1 || n.ihash_set(sb.ino)) {
                     n.dir_blocks += if n.cfg.sort.apparentsz {
-                        sb.st_size
+                        sb.size
                     } else {
-                        sb.st_blocks
+                        sb.blocks512 as i64
                     };
                 }
                 n.num_files += 1;
@@ -608,25 +579,25 @@ impl DuHook for DuFill<'_> {
     /// Sets `blocks` for a non-directory; false to stop (interrupt), the entry not added.
     fn entry(
         &mut self,
-        fd: BorrowedFd<'_>,
+        dir: &Dir,
         path: &[u8],
-        name: &CStr,
-        sb: Option<&Stat>,
+        name: &[u8],
+        sb: Option<&FileInfo>,
         idx: usize,
         blocks: &mut u64,
     ) -> bool {
         let n = &mut *self.nnn;
         // Use resolved (dev,ino) for duplicate check so symlink-to-dir and real dir count once
         let resolved = match sb {
-            Some(s) if is_lnk(s.st_mode) => rustix::fs::statat(fd, name, AtFlags::empty()).ok(),
+            Some(s) if is_lnk(s.mode) => dir.stat_at(name, true).ok(),
             Some(s) => Some(*s),
             None => None,
         };
-        match resolved.filter(|s| is_dir(s.st_mode)) {
+        match resolved.filter(|s| is_dir(s.mode)) {
             Some(sd) => {
-                let (buf, _) = mkpath(path, name.to_bytes(), &n.home);
-                let first = test_set_bit_dir(&mut n.du.dir_dispatched_bmp, sd.st_dev, sd.st_ino);
-                n.dirwalk(&buf, idx as i32, self.path_dev != sd.st_dev, !first);
+                let (buf, _) = mkpath(path, name, &n.home);
+                let first = test_set_bit_dir(&mut n.du.dir_dispatched_bmp, sd.dev, sd.ino);
+                n.dirwalk(&buf, idx as i32, self.path_dev != sd.dev, !first);
                 if n.du_interrupted() {
                     return false;
                 }
@@ -634,7 +605,7 @@ impl DuHook for DuFill<'_> {
             }
             None => {
                 let (size, nblk, mode, nlink, ino) = sb.map_or((0, 0, 0, 0, 0), |s| {
-                    (s.st_size, s.st_blocks, s.st_mode, s.st_nlink, s.st_ino)
+                    (s.size, s.blocks512 as i64, s.mode, s.nlink, s.ino)
                 });
                 let b = if n.cfg.sort.apparentsz { size } else { nblk };
                 // dir_blocks adds the stored (40-bit) value, as the original does.

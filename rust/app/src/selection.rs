@@ -7,6 +7,7 @@
 //! `invertselbuf` take, and `findinsel`/`rmfromselbuf` take the bytes to look for.
 
 use crate::config::{cstr, is_prefix, xstrsncpy};
+use crate::platform::path;
 use crate::popup::{F_CLI, F_CONFIRM};
 use crate::sort::{FILE_SCANNED, FILE_SELECTED};
 use crate::state::{NAME_MAX, Nnn, PATH_MAX};
@@ -23,7 +24,6 @@ const MSG_RM_TMP: &[u8] = b"remove tmp file?";
 /// `utils[UTIL_SH_EXEC]`.
 const UTIL_SH_EXEC: &[u8] = b"sh -c";
 
-use crate::platform::path;
 /// One write(2), true when all of `buf` went out (as `write(fd, buf, n) == n`).
 fn write_once(f: &mut dyn Write, buf: &[u8]) -> bool {
     matches!(f.write(buf), Ok(n) if n == buf.len())

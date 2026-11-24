@@ -150,43 +150,6 @@ impl Drop for Regex {
     }
 }
 
-fn name_from(buf: &[c_char], p: *const c_char) -> Option<Vec<u8>> {
-    if p.is_null() {
-        return None;
-    }
-    let _ = buf;
-    // SAFETY: p points into buf, which getpwuid_r/getgrgid_r filled with a NUL-terminated name.
-    Some(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec())
-}
-
-/// `getpwuid(uid)->pw_name`
-pub fn pw_name(uid: u32) -> Option<Vec<u8>> {
-    let mut buf = vec![0 as c_char; 16384];
-    // SAFETY: passwd is plain data; getpwuid_r fills it and points its strings into buf.
-    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut res: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: all pointers are valid for the call and buf.len() is its size.
-    let rc = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut res) };
-    if rc != 0 || res.is_null() {
-        return None;
-    }
-    name_from(&buf, pw.pw_name)
-}
-
-/// `getgrgid(gid)->gr_name`
-pub fn gr_name(gid: u32) -> Option<Vec<u8>> {
-    let mut buf = vec![0 as c_char; 16384];
-    // SAFETY: group is plain data; getgrgid_r fills it and points its strings into buf.
-    let mut gr: libc::group = unsafe { std::mem::zeroed() };
-    let mut res: *mut libc::group = std::ptr::null_mut();
-    // SAFETY: all pointers are valid for the call and buf.len() is its size.
-    let rc = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut res) };
-    if rc != 0 || res.is_null() {
-        return None;
-    }
-    name_from(&buf, gr.gr_name)
-}
-
 /// glibc `iswalnum` in the current LC_CTYPE.
 pub fn is_walnum(c: i32) -> bool {
     // SAFETY: iswalnum takes any wint_t.
