@@ -366,17 +366,41 @@ fn fgets(r: &mut impl BufRead) -> Option<Vec<u8>> {
     (!line.is_empty()).then_some(line)
 }
 
-/// `COLORS` as terminfo gives it, from the terminal's name.
-fn term_colors() -> i32 {
-    let term = getenv("TERM").unwrap_or_default();
-    let has = |s: &[u8]| term.windows(s.len()).any(|w| w == s);
-    if has(b"256color") || has(b"direct") {
+/// `COLORS` as terminfo gives it, from the terminal's name and environment.
+fn term_colors_from(
+    term: Option<&[u8]>,
+    colorterm: Option<&[u8]>,
+    wt_session: bool,
+    is_windows: bool,
+) -> i32 {
+    let has = |hay: Option<&[u8]>, needle: &[u8]| {
+        hay.is_some_and(|h| h.windows(needle.len()).any(|w| w == needle))
+    };
+    if is_windows
+        || wt_session
+        || has(term, b"256color")
+        || has(term, b"direct")
+        || has(colorterm, b"truecolor")
+        || has(colorterm, b"24bit")
+    {
         256
-    } else if has(b"88color") {
+    } else if has(term, b"88color") {
         88
     } else {
         8
     }
+}
+
+fn term_colors() -> i32 {
+    let term = getenv("TERM");
+    let colorterm = getenv("COLORTERM");
+    let wt_session = getenv("WT_SESSION").is_some();
+    term_colors_from(
+        term.as_deref(),
+        colorterm.as_deref(),
+        wt_session,
+        cfg!(windows),
+    )
 }
 
 /// `_ABSSUB`
@@ -3064,6 +3088,26 @@ mod tests {
             Some([4; CTX_MAX])
         );
         assert!(parse_ctx_colors(Some(b"#0a1"), false, 256, &mut f).is_none());
+    }
+
+    #[test]
+    fn term_colors_from_detects_windows_and_colorterm() {
+        assert_eq!(term_colors_from(None, None, false, true), 256);
+        assert_eq!(
+            term_colors_from(None, Some(b"truecolor"), false, false),
+            256
+        );
+        assert_eq!(term_colors_from(None, Some(b"24bit"), false, false), 256);
+        assert_eq!(term_colors_from(Some(b"xterm"), None, true, false), 256);
+        assert_eq!(
+            term_colors_from(Some(b"xterm-256color"), None, false, false),
+            256
+        );
+        assert_eq!(
+            term_colors_from(Some(b"xterm-88color"), None, false, false),
+            88
+        );
+        assert_eq!(term_colors_from(Some(b"vt100"), None, false, false), 8);
     }
 
     #[test]

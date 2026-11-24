@@ -555,7 +555,7 @@ impl Nnn {
             if ent.flags & FILE_MISSING != 0 {
                 color = C_MIS;
             }
-            if color != 0 && self.fcolors.get(color as usize).is_some_and(|&c| c != 0) {
+            if color != 0 && self.fcolor_enabled(color as usize) {
                 attrs |= color_pair(color);
             }
         }
@@ -577,8 +577,12 @@ impl Nnn {
         }
     }
 
+    fn fcolor_enabled(&self, color: usize) -> bool {
+        self.browse.fcolors.get(color).is_some_and(|&c| c != 0)
+    }
+
     fn fcolors_mis(&self) -> bool {
-        self.fcolors.get(C_MIS as usize).is_some_and(|&c| c != 0)
+        self.fcolor_enabled(C_MIS as usize)
     }
 
     /// `print_time`
@@ -1488,4 +1492,19 @@ pub fn wcstombs_n(w: &[i32], n: usize) -> Vec<u8> {
         out.extend_from_slice(&b);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fcolors_lookup_uses_browse_fcolors_for_file_types() {
+        let mut nnn = Nnn::default();
+        nnn.browse.fcolors[C_EXE as usize] = 0x2e;
+        nnn.browse.fcolors[C_MIS as usize] = 0xc4;
+        assert!(nnn.fcolors_mis());
+        assert!(nnn.fcolor_enabled(C_EXE as usize));
+        assert!(!nnn.fcolor_enabled(C_DIR as usize));
+    }
 }
