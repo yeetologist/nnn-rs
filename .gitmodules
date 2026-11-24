@@ -1,0 +1,3 @@
+[submodule "reference/nnn"]
+	path = reference/nnn
+	url = https://github.com/jarun/nnn

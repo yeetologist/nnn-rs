@@ -1,0 +1,8 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "nnn",
+  "run": [
+    "reference/nnn/nnn"
+  ],
+  "timeout_secs": 10
+}

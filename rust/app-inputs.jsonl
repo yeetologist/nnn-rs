@@ -1,0 +1,54 @@
+{"name":"help","args":["-h"],"stdin":""}
+{"name":"version","args":["-V"],"stdin":""}
+{"name":"invalid-opt","args":["-Z"],"stdin":""}
+{"name":"key-collision","args":["-K"],"stdin":""}
+{"name":"regex-and-fuzzy","args":["-g","-z"],"stdin":""}
+{"name":"fuzzy-and-regex","args":["-z","-g"],"stdin":""}
+{"name":"fifo-mode-bad","args":["-F","2"],"stdin":""}
+{"name":"fifo-mode-neg","args":["-F","-1"],"stdin":""}
+{"name":"b-missing-arg","args":["-b"],"stdin":""}
+{"name":"T-missing-arg","args":["-T"],"stdin":""}
+{"name":"help-after-flags","args":["-dH","-h"],"stdin":""}
+{"name":"version-wins-first","args":["-V","-h"],"stdin":""}
+{"name":"picker-bad-path","args":["-p","/nonexistent/dir/sel","-V"],"stdin":""}
+{"name":"empty-stdin","args":[],"stdin":""}
+{"name":"empty-stdin-dir","args":["-d","."],"stdin":""}
+{"name":"nnn-opts-version","args":[],"env":{"NNN_OPTS":"V"},"stdin":""}
+{"name":"nnn-opts-dash-version","args":[],"env":{"NNN_OPTS":"-V"},"stdin":""}
+{"name":"nnn-opts-unexpected","args":[],"env":{"NNN_OPTS":"Hd foo"},"stdin":""}
+{"name":"nnn-opts-invalid","args":[],"env":{"NNN_OPTS":"Z"},"stdin":""}
+{"name":"nnn-opts-help","args":[],"env":{"NNN_OPTS":"  H   h "},"stdin":""}
+{"name":"nnn-opts-regex-fuzzy","args":[],"env":{"NNN_OPTS":"g z"},"stdin":""}
+{"name":"dashdash-version","args":["--","-V"],"stdin":""}
+{"name":"dash-alone","args":["-","-V"],"stdin":""}
+{"name":"long-opt","args":["--foo"],"stdin":""}
+{"name":"colon-opt","args":["-:"],"stdin":""}
+{"name":"semicolon-opt","args":["-;"],"stdin":""}
+{"name":"nonascii-opt","args":["-é"],"stdin":""}
+{"name":"permute-version","args":["somedir","-V"],"stdin":""}
+{"name":"posixly-correct","args":["somedir","-V"],"stdin":"","env":{"POSIXLY_CORRECT":"1"}}
+{"name":"cluster-with-arg","args":["-dbx","-V"],"stdin":""}
+{"name":"cluster-arg-next","args":["-db","-V"],"stdin":""}
+{"name":"x11-empty-stdin","args":["-x"],"stdin":""}
+{"name":"x11-picker-empty-stdin","args":["-x","-p","-"],"stdin":""}
+{"name":"l-junk","args":["-l","abc"],"stdin":""}
+{"name":"t-neg","args":["-t","-5"],"stdin":""}
+{"name":"P-multi","args":["-P","ab"],"stdin":""}
+{"name":"s-name","args":["-s","work"],"stdin":""}
+{"name":"S-flag","args":["-S"],"stdin":""}
+{"name":"all-flags","args":["-aABcCdDeEfgHiJnNoQrRSuUx0","-V"],"stdin":""}
+{"name":"p-stdout","args":["-p","-","-V"],"stdin":""}
+{"name":"p-then-help","args":["-p","sel","-h"],"stdin":""}
+{"name":"opts-conflict-env-argv","args":["-z"],"stdin":"","env":{"NNN_OPTS":"g"}}
+{"name":"opts-env-p-missing","args":[],"stdin":"","env":{"NNN_OPTS":"p"}}
+{"name":"opts-env-dash","args":[],"stdin":"","env":{"NNN_OPTS":"-"}}
+{"name":"opts-env-then-argv-version","args":["-V"],"stdin":"","env":{"NNN_OPTS":"H"}}
+{"name":"opts-env-empty","args":[],"stdin":"","env":{"NNN_OPTS":"   "}}
+{"name":"opts-env-cluster","args":[],"stdin":"","env":{"NNN_OPTS":"dHV"}}
+{"name":"opts-env-arg-sep","args":["-V"],"stdin":"","env":{"NNN_OPTS":"T s"}}
+{"name":"opts-env-invalid-then-argv","args":[],"stdin":"","env":{"NNN_OPTS":"q"}}
+{"name":"F-plus","args":["-F","+1"],"stdin":""}
+{"name":"F-space","args":["-F"," 1"],"stdin":""}
+{"name":"F-junk","args":["-F","1x"],"stdin":""}
+{"name":"stdin-only-nuls","args":[],"stdin":"\u0000\u0000\u0000"}
+{"name":"stdin-newlines","args":[],"stdin":"\n\n"}

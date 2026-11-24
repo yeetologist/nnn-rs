@@ -1,0 +1,20 @@
+[package]
+name = "nnn"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "nnn, the terminal file manager, ported from C to Rust (rust/DECISIONS.md)"
+
+[[bin]]
+name = "nnn"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2.191"
+rustix = { version = "1.1.6", features = ["event", "fs", "process", "stdio", "termios"] }
+signal-hook = "0.4.6"
+
+[workspace]
+
+[dev-dependencies]
+trycmd = "1.2.1"

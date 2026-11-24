@@ -1,0 +1,4 @@
+bin.name = "nnn"
+args = ["-d", "👍🏽 thumbs"]
+status.code = 1
+fs.sandbox = true

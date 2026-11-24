@@ -1,0 +1,5 @@
+bin.name = "nnn"
+args = ["-V"]
+env.add.NNN_OPTS = "H"
+status.code = 0
+fs.sandbox = true

@@ -1,0 +1,4 @@
+bin.name = "nnn"
+args = ["-g", "-z"]
+status.code = 1
+fs.sandbox = true
