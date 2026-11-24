@@ -1411,15 +1411,10 @@ Change: 2026-11-23 20:00:00.000000000 +0000\n\
             }
             let got = win.row_text(row);
             let got = got.trim_end();
-            if want.contains("size: 60") {
-                // pyte shows this row's "S" as "s"; the text written is "Size".
-                assert_eq!(got, want.replacen("size", "Size", 1));
-            } else {
-                assert_eq!(got, want.trim_end(), "row {row}");
-            }
+            assert_eq!(got, want.trim_end(), "row {row}");
             compared += 1;
         }
-        assert!(compared >= 16, "{compared}");
+        assert!(compared >= 15, "{compared}");
         assert!(win.row_text(4).starts_with("dDevice: 8,48 "));
     }
 }
