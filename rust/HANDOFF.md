@@ -1,6 +1,6 @@
 # Handoff (2026-11-24, port complete; repo moved to nnn-rs)
 
-State: all waves W1-W6 done; W7 (Windows) claimed, see MAP.md. rust/app builds the pure Rust `nnn` (no fallback). The C original is the git submodule reference/nnn (a93d0bd4); build it with `git submodule update --init && make -C reference/nnn`.
+State: all waves W1-W6 done; W7 (Windows) in progress: T1-T3 done (platform paths, file info, directories, devices, errno text), T4 next; see MAP.md. rust/app builds the pure Rust `nnn` (no fallback). The C original is the git submodule reference/nnn (a93d0bd4); build it with `git submodule update --init && make -C reference/nnn`.
 Proof suites (run in WSL Ubuntu, repo /mnt/d/Documents/Github/nnn-rs, ADR-002):
 - `cd rust/app && cargo test` (unit tests + rust/app-cases through trycmd)
 - `rust-anything app replay . --build rust/app/target/debug/nnn`
