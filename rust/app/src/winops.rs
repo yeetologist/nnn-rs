@@ -23,11 +23,16 @@ fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     v
 }
 
-/// `EINVAL` when `dest_dir/<name of src>` is `src` itself or inside it.
+/// `EINVAL` when `dest_dir/<name of src>` is `src` itself, or (for a real directory) inside
+/// it. A link at `src` is not followed: the link itself is what is copied or moved.
 fn check_target(src: &[u8], dest_dir: &[u8]) -> io::Result<()> {
-    let s = fs::canonicalize(path(src))?;
+    let parent = fs::canonicalize(path(platform::xdirname(src)))?;
     let d = fs::canonicalize(path(dest_dir))?;
-    if d.starts_with(&s) || s.parent() == Some(d.as_path()) {
+    if parent == d {
+        return Err(platform::error(Errno::Inval));
+    }
+    let real_dir = fs::symlink_metadata(path(src))?.is_dir();
+    if real_dir && d.starts_with(parent.join(&*platform::os(base(src)))) {
         return Err(platform::error(Errno::Inval));
     }
     Ok(())
@@ -60,10 +65,15 @@ fn copy_entry(src: &[u8], dst: &[u8], ask: &mut dyn FnMut(&[u8]) -> bool) -> io:
         }
         return set_mtime(dst, meta.modified()?);
     }
-    if existing.is_some() {
+    if let Some(m) = existing {
+        // cp: cannot overwrite directory with non-directory.
+        if m.is_dir() {
+            return Err(platform::error(Errno::Exist));
+        }
         if !ask(base(dst)) {
             return Ok(());
         }
+        // A link replaces the file or link there (never a directory, refused above).
         if meta.file_type().is_symlink() {
             remove_all(dst)?;
         }
@@ -134,6 +144,19 @@ pub fn remove_all(p: &[u8]) -> io::Result<()> {
     } else {
         fs::remove_file(path(p))
     }
+}
+
+/// `rm -ri`'s answer for one entry: unless `force`, `confirm(path)` decides first. True
+/// when `path` was removed, false when declined.
+pub fn remove_confirmed(
+    p: &[u8],
+    force: bool,
+    confirm: &mut dyn FnMut(&[u8]) -> bool,
+) -> io::Result<bool> {
+    if !force && !confirm(p) {
+        return Ok(false);
+    }
+    remove_all(p).map(|()| true)
 }
 
 /// A link to a directory (Windows removes it as a directory).
@@ -451,6 +474,88 @@ mod tests {
             String::from_utf8(file_info_text(&b(&dir.join("none"))))
                 .unwrap()
                 .contains("No such file or directory")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_confirmed_asks_unless_forced() {
+        let dir = scratch("rmask");
+        std::fs::create_dir_all(dir.join("t").join("u")).unwrap();
+        let t = b(&dir.join("t"));
+        let mut asked = Vec::new();
+        let mut no = |p: &[u8]| {
+            asked.push(p.to_vec());
+            false
+        };
+        assert!(!remove_confirmed(&t, false, &mut no).unwrap());
+        assert_eq!(asked, std::slice::from_ref(&t));
+        assert!(dir.join("t").join("u").is_dir());
+        assert!(remove_confirmed(&t, true, &mut never).unwrap());
+        assert!(!dir.join("t").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_and_dir_never_replace_each_other() {
+        let dir = scratch("kinds");
+        std::fs::create_dir_all(dir.join("d").join("x").join("keep")).unwrap();
+        std::fs::write(dir.join("x"), b"file").unwrap();
+        // A file onto a directory: refused before asking, the directory stays.
+        assert!(copy_into(&b(&dir.join("x")), &b(&dir.join("d")), &mut never).is_err());
+        assert!(dir.join("d").join("x").join("keep").is_dir());
+        // A directory onto a file: refused, the file stays.
+        std::fs::create_dir_all(dir.join("s").join("x")).unwrap();
+        std::fs::write(dir.join("e"), b"").unwrap();
+        std::fs::create_dir(dir.join("d2")).unwrap();
+        std::fs::write(dir.join("d2").join("x"), b"file").unwrap();
+        assert!(
+            copy_into(
+                &b(&dir.join("s").join("x")),
+                &b(&dir.join("d2")),
+                &mut never
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(dir.join("d2").join("x")).unwrap(), b"file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Makes the link `at` to `target`; false (with a note) where links need a privilege.
+    fn link(target: &[u8], at: &Path, is_dir: bool) -> bool {
+        match platform::symlink(target, &b(at), is_dir) {
+            Ok(()) => true,
+            Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => {
+                println!("note: no symlink privilege, link case skipped");
+                false
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn links_are_copied_not_followed() {
+        let dir = scratch("links");
+        std::fs::create_dir_all(dir.join("x").join("sub")).unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let target = b(&dir.join("x"));
+        if !link(&target, &dir.join("d").join("l"), true) {
+            return;
+        }
+        // Into its own directory: refused, the link stays.
+        let l = b(&dir.join("d").join("l"));
+        assert!(copy_into(&l, &b(&dir.join("d")), &mut |_| true).is_err());
+        assert_eq!(platform::readlink(&l).unwrap(), target);
+        // A link to a directory moves into that directory's subtree (only the link moves).
+        move_into(&l, &b(&dir.join("x").join("sub")), &mut never).unwrap();
+        let moved = b(&dir.join("x").join("sub").join("l"));
+        assert_eq!(platform::readlink(&moved).unwrap(), target);
+        // A dangling link copies as it is.
+        assert!(link(b"nowhere", &dir.join("dang"), false));
+        copy_into(&b(&dir.join("dang")), &b(&dir.join("d")), &mut never).unwrap();
+        assert_eq!(
+            platform::readlink(&b(&dir.join("d").join("dang"))).unwrap(),
+            b"nowhere"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

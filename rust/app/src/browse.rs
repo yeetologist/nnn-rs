@@ -2906,7 +2906,7 @@ impl Nnn {
             }
             // Windows has no rm: the entry is removed here.
             #[cfg(windows)]
-            if let Err(e) = crate::winops::remove_all(fpath) {
+            if let Err(e) = self.remove_native(fpath, r == b'f') {
                 self.printwait(sys::strerror(&e).as_bytes(), None);
             }
         } else {

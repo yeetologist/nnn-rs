@@ -524,10 +524,7 @@ impl Nnn {
         let mut failed = false;
         for p in list.split(|&c| c == 0).filter(|p| !p.is_empty()) {
             let done = if remove {
-                if !force && !xconfirm(self.get_input(Some(&rm_prompt(p)))) {
-                    continue;
-                }
-                winops::remove_all(p)
+                self.remove_native(p, force).map(drop)
             } else {
                 let mut ask = |_: &[u8]| xconfirm(self.get_input(Some(MESSAGES[MSG_OVERWRITE])));
                 if sel == Action::Cp {
@@ -546,6 +543,14 @@ impl Nnn {
         }
         self.clearselection();
         true
+    }
+
+    /// `rm -rf` (`force`) or `rm -ri` of one path on Windows: unless forced,
+    /// `rm -rf '<name>'?` is asked first. True when it was removed.
+    #[cfg(windows)]
+    pub(crate) fn remove_native(&mut self, p: &[u8], force: bool) -> std::io::Result<bool> {
+        let mut confirm = |p: &[u8]| crate::prompt::xconfirm(self.get_input(Some(&rm_prompt(p))));
+        crate::winops::remove_confirmed(p, force, &mut confirm)
     }
 
     /// `batch_rename`: rename the current dir's entries or the selection in the editor.
