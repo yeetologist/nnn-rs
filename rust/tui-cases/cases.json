@@ -1747,5 +1747,38 @@
    "g\\.tar"
   ],
   "quiet": 1.5
+ },
+ {
+  "name": "win-drive-picker",
+  "platforms": [
+   "windows"
+  ],
+  "note": "Recorded on Windows (hand-verified first run): D opens the drive picker, Esc cancels, D then c jumps to C:/, and - returns to the previous directory. Only the header is compared because host drives and C:/ entries vary.",
+  "args": [],
+  "keys": [
+   "D",
+   "<Esc>",
+   "D",
+   "c",
+   "-",
+   "q"
+  ],
+  "fixture": {
+   "a": "x\n"
+  },
+  "normalize": [
+   [
+    "^1 2 3 4 5 6 7 8 ",
+    "@"
+   ],
+   [
+    "^[^@].*$",
+    ""
+   ],
+   [
+    "^@",
+    "1 2 3 4 5 6 7 8 "
+   ]
+  ]
  }
 ]

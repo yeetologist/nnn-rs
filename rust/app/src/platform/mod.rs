@@ -126,6 +126,30 @@ pub fn xdirname(p: &[u8]) -> &[u8] {
     xdirname_with(Os::CURRENT, p)
 }
 
+/// The root directory of `path` for `os`: `/` on Unix; `C:/` or `//server/share/` on Windows
+/// (falling back to `/` for a relative path).
+pub fn current_root_with(os: Os, path: &[u8]) -> Vec<u8> {
+    match os {
+        Os::Unix => b"/".to_vec(),
+        Os::Windows => {
+            let n = root_len_with(Os::Windows, path);
+            if n == 0 {
+                return b"/".to_vec();
+            }
+            let mut out = path[..n].to_vec();
+            if !out.ends_with(b"/") {
+                out.push(b'/');
+            }
+            out
+        }
+    }
+}
+
+/// `current_root_with` for this OS.
+pub fn current_root(path: &[u8]) -> Vec<u8> {
+    current_root_with(Os::CURRENT, path)
+}
+
 /// The `struct stat` fields nnn uses. On Windows `mode` is synthesized, `uid` and `gid` are 0,
 /// `dev` is the volume serial number and `ino` the file index.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -462,6 +486,38 @@ pub fn fs_blocks(path: &[u8]) -> Option<FsBlocks> {
     backend::fs_blocks(path)
 }
 
+/// Logical drive kind (Windows drive picker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveKind {
+    Fixed,
+    Removable,
+    Remote,
+    CdRom,
+    RamDisk,
+    Unknown,
+}
+
+/// Metadata for one logical drive (Windows drive picker).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriveInfo {
+    /// Uppercase ASCII drive letter, e.g. `b'C'`.
+    pub letter: u8,
+    /// Canonical internal root path, e.g. `b"C:/"`.
+    pub root: Vec<u8>,
+    pub kind: DriveKind,
+    /// Volume label, empty if unavailable or skipped.
+    pub label: Vec<u8>,
+    /// Filesystem name (e.g. `b"NTFS"`), empty if unavailable or skipped.
+    pub fs_type: Vec<u8>,
+    /// `(avail_bytes, total_bytes)` when available.
+    pub space: Option<(u64, u64)>,
+}
+
+/// Enumerates logical drives on Windows; empty on Unix.
+pub fn list_drives() -> Vec<DriveInfo> {
+    backend::list_drives()
+}
+
 /// `xchmod`'s system calls: toggles the execute bits of `path` (not following a link):
 /// all three off if the owner's is set, else all three on. The new mode, if it changed.
 pub fn toggle_exec(path: &[u8]) -> Option<u32> {
@@ -601,6 +657,23 @@ mod tests {
         assert!(!is_root(b""));
         assert!(!is_root(b"rel"));
         assert_eq!(is_absolute(b"/x"), Os::CURRENT == Os::Unix);
+    }
+
+    #[test]
+    fn current_root_resolves_drive_and_unc() {
+        assert_eq!(current_root_with(Os::Unix, b"/usr/local/bin"), b"/");
+        assert_eq!(current_root_with(Os::Unix, b"/"), b"/");
+        assert_eq!(current_root_with(Os::Windows, b"C:/Users/Alice"), b"C:/");
+        assert_eq!(current_root_with(Os::Windows, b"D:/"), b"D:/");
+        assert_eq!(
+            current_root_with(Os::Windows, b"//srv/share/dir"),
+            b"//srv/share/"
+        );
+        assert_eq!(
+            current_root_with(Os::Windows, b"//srv/share"),
+            b"//srv/share/"
+        );
+        assert_eq!(current_root_with(Os::Windows, b"rel"), b"/");
     }
 
     #[test]

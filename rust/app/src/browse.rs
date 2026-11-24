@@ -1581,6 +1581,8 @@ impl Nnn {
                 Flow::Top
             }
             A::Cdhome | A::Cdbegin | A::Cdlast | A::Cdroot | A::Bmopen => self.sel_cd(b, sel),
+            #[cfg(windows)]
+            A::Drives => self.sel_drives(b),
             A::Remote => {
                 if !self.remote_mount(&mut b.newpath) {
                     return Flow::MsgwaitNochange;
@@ -2107,7 +2109,7 @@ impl Nnn {
                 Action::Cdhome => self.home.clone(),
                 Action::Cdbegin => b.ipath.clone(),
                 Action::Cdlast => lastdir.clone(),
-                _ => b"/".to_vec(),
+                _ => platform::current_root(&path),
             };
             if dir.is_empty() {
                 self.printwait(MESSAGES[MSG_NOT_SET], Some(&mut b.presel));
@@ -2147,6 +2149,31 @@ impl Nnn {
         let keep = self.listpath.is_some() && sel == Action::Cdlast;
         let np = b.newpath.clone();
         if self.cdprep(!keep, &np) {
+            b.presel = FILTER;
+        } else {
+            b.watch = true;
+        }
+        Flow::Begin
+    }
+
+    /// Windows built-in drive picker (`D`, ADR-030).
+    #[cfg(windows)]
+    fn sel_drives(&mut self, b: &mut Locals) -> Flow {
+        let path = self.cpath();
+        let Some(dir) = self.pick_drive(&path) else {
+            return Flow::Top;
+        };
+        self.g_state.selbm = false;
+        if path == dir {
+            return Flow::Top;
+        }
+        if !chdir(&dir) {
+            self.printwarn(Some(&mut b.presel));
+            return Flow::Nochange;
+        }
+        b.newpath = ncpy(&dir, PATH_MAX);
+        let np = b.newpath.clone();
+        if self.cdprep(true, &np) {
             b.presel = FILTER;
         } else {
             b.watch = true;

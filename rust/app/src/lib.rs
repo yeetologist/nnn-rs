@@ -5,6 +5,7 @@ pub mod config;
 pub mod curses;
 pub mod dir;
 pub mod draw;
+pub mod drives;
 pub mod du;
 pub mod fileops;
 pub mod fmt;

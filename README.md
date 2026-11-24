@@ -18,9 +18,10 @@ Windows 10 1809 or later (ConPTY), x86_64. Install from the repo root:
 or take the release binary `nnn.exe`. Use Windows Terminal (conhost works too).
 
 - Git for Windows (`sh.exe` on PATH) is needed for sh-based plugins and for POSIX syntax in the `!` shell and the `]` command prompt. Without it those fall back to `cmd /C` and plugins report "sh not found (Git for Windows)". Everything else — including copy/move/remove, duplicate, and archiving a selection — runs without extra tools.
+- Built-in drive picker: press `D` to jump between logical drives (`C:/`, `D:/`, USB, mapped network shares) while `h` / `Left` stops at the current drive root like Unix `nnn` at `/` (ADR-030).
 - List mode (paths from stdin) needs symlinks: turn on Developer Mode or run elevated.
 - Not supported (nnn says so): NNN_FIFO, mounts and archive mounting, the permission editor (chmod).
-- Differences: Ctrl-Break is ignored (like SIGQUIT on Linux); locale is C.UTF-8 behaviour (code point sorting, Unicode regex classes); archiving very large selections (>28 KB of paths) with non-ASCII names falls back to Windows `tar.exe -T`, which reads its list in the legacy ANSI codepage. Full list: ADR-022..029 in `rust/DECISIONS.md`.
+- Differences: Ctrl-Break is ignored (like SIGQUIT on Linux); locale is C.UTF-8 behaviour (code point sorting, Unicode regex classes); archiving very large selections (>28 KB of paths) with non-ASCII names falls back to Windows `tar.exe -T`, which reads its list in the legacy ANSI codepage. Full list: ADR-022..030 in `rust/DECISIONS.md`.
 
 ### With Microsoft Coreutils
 

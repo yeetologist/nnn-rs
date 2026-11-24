@@ -1,6 +1,9 @@
 //! The Windows backend: byte paths are WTF-8 (`OsStr::as_encoded_bytes`), shown with `/`.
 
-use super::{Access, DType, Defaults, Errno, FileInfo, FsBlocks, ReadResult, SignalStep};
+use super::{
+    Access, DType, Defaults, DriveInfo, DriveKind, Errno, FileInfo, FsBlocks, ReadResult,
+    SignalStep,
+};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -19,8 +22,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NOTIFY_CHANGE_DIR_NAME,
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
     FILE_STANDARD_INFO, FileBasicInfo, FileStandardInfo, FindCloseChangeNotification,
-    FindFirstChangeNotificationW, FindNextChangeNotification, GetDiskFreeSpaceExW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx,
+    FindFirstChangeNotificationW, FindNextChangeNotification, GetDiskFreeSpaceExW, GetDriveTypeW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetLogicalDrives,
+    GetVolumeInformationW,
 };
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
@@ -31,9 +35,13 @@ use windows_sys::Win32::System::Console::{
     STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP,
     SetStdHandle, WINDOW_BUFFER_SIZE_EVENT,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetThreadErrorMode};
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CreateEventW, DETACHED_PROCESS, INFINITE, ResetEvent, SetEvent,
     WaitForMultipleObjects, WaitForSingleObject,
+};
+use windows_sys::Win32::System::WindowsProgramming::{
+    DRIVE_CDROM, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
 };
 use windows_sys::core::BOOL;
 
@@ -617,6 +625,122 @@ pub fn fs_blocks(path: &[u8]) -> Option<FsBlocks> {
         bfree: free,
         bavail: avail,
     })
+}
+
+/// Suppresses modal "Insert a disk" error dialogs while probing drives, restoring the
+/// thread error mode on drop.
+struct ErrorModeGuard {
+    prev: u32,
+    active: bool,
+}
+
+impl ErrorModeGuard {
+    fn suppress_critical_errors() -> Self {
+        let mut prev = 0u32;
+        // SAFETY: `prev` is a valid writable u32 pointer; SetThreadErrorMode only affects this thread.
+        let ok = unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mut prev) };
+        Self {
+            prev,
+            active: ok != 0,
+        }
+    }
+}
+
+impl Drop for ErrorModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: restores the thread error mode previously returned by SetThreadErrorMode.
+            unsafe {
+                SetThreadErrorMode(self.prev, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+fn wide_cstr_bytes(buf: &[u16]) -> Vec<u8> {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    bytes(&OsString::from_wide(&buf[..end])).into_owned()
+}
+
+/// Enumerates active Windows logical drives (`A:/`..`Z:/`) with type, label, filesystem,
+/// and capacity. Skips volume/space queries on `DRIVE_REMOTE` so disconnected SMB shares
+/// cannot stall the UI.
+pub fn list_drives() -> Vec<DriveInfo> {
+    let _guard = ErrorModeGuard::suppress_critical_errors();
+    // SAFETY: GetLogicalDrives takes no arguments and returns a bitmask of drives A..Z.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u8 {
+        if mask & (1u32 << i) == 0 {
+            continue;
+        }
+        let letter = b'A' + i;
+        let wide_root = [u16::from(letter), u16::from(b':'), u16::from(b'\\'), 0];
+        // SAFETY: wide_root is a NUL-terminated UTF-16 drive root path.
+        let raw_kind = unsafe { GetDriveTypeW(wide_root.as_ptr()) };
+        if raw_kind == DRIVE_NO_ROOT_DIR {
+            continue;
+        }
+        let kind = match raw_kind {
+            DRIVE_FIXED => DriveKind::Fixed,
+            DRIVE_REMOVABLE => DriveKind::Removable,
+            DRIVE_REMOTE => DriveKind::Remote,
+            DRIVE_CDROM => DriveKind::CdRom,
+            DRIVE_RAMDISK => DriveKind::RamDisk,
+            _ => DriveKind::Unknown,
+        };
+
+        let mut label = Vec::new();
+        let mut fs_type = Vec::new();
+        let mut space = None;
+
+        if kind != DriveKind::Remote {
+            let mut label_buf = [0u16; 261];
+            let mut fs_buf = [0u16; 261];
+            // SAFETY: wide_root is NUL-terminated; label_buf and fs_buf are writable buffers
+            // whose lengths match the passed capacities; unused outputs are null.
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    wide_root.as_ptr(),
+                    label_buf.as_mut_ptr(),
+                    label_buf.len() as u32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    fs_buf.as_mut_ptr(),
+                    fs_buf.len() as u32,
+                )
+            };
+            if ok != 0 {
+                label = wide_cstr_bytes(&label_buf);
+                fs_type = wide_cstr_bytes(&fs_buf);
+            }
+
+            let (mut avail, mut total) = (0u64, 0u64);
+            // SAFETY: wide_root is NUL-terminated; avail and total are writable u64s.
+            let ok = unsafe {
+                GetDiskFreeSpaceExW(
+                    wide_root.as_ptr(),
+                    &mut avail,
+                    &mut total,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 && total > 0 {
+                space = Some((avail, total));
+            }
+        }
+
+        out.push(DriveInfo {
+            letter,
+            root: vec![letter, b':', b'/'],
+            kind,
+            label,
+            fs_type,
+            space,
+        });
+    }
+    out
 }
 
 /// Windows files have no execute bits to toggle.
@@ -1233,5 +1357,33 @@ mod tests {
         assert!(s.ends_with(r"\b\c"), "got {s}");
         assert!(!s.contains(r"\..\"), "got {s}");
         assert!(!s.contains(r"\.\"), "got {s}");
+    }
+
+    #[test]
+    fn list_drives_includes_system_drive() {
+        let drives = list_drives();
+        assert!(!drives.is_empty());
+        let sys_letter = std::env::var("SystemDrive")
+            .ok()
+            .and_then(|s| s.bytes().next())
+            .map(|b| b.to_ascii_uppercase())
+            .unwrap_or(b'C');
+        assert!(
+            drives.iter().any(|d| d.letter == sys_letter),
+            "expected system drive {} in {drives:?}",
+            char::from(sys_letter)
+        );
+    }
+
+    #[test]
+    fn list_drives_sorted_and_well_formed() {
+        let drives = list_drives();
+        for w in drives.windows(2) {
+            assert!(w[0].letter < w[1].letter);
+        }
+        for d in &drives {
+            assert!(d.letter.is_ascii_uppercase());
+            assert_eq!(d.root, vec![d.letter, b':', b'/']);
+        }
     }
 }

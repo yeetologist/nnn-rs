@@ -78,6 +78,8 @@ pub enum Action {
     Cdbegin,
     Cdlast,
     Cdroot,
+    #[cfg(windows)]
+    Drives,
     Bmopen,
     Remote,
     Cycle,
@@ -165,6 +167,8 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::Char(64), Action::Cdbegin),
     (Key::Char(45), Action::Cdlast),
     (Key::Char(96), Action::Cdroot),
+    #[cfg(windows)]
+    (Key::Char(b'D'), Action::Drives),
     (Key::Char(98), Action::Bmopen),
     (Key::Char(31), Action::Bmopen),
     (Key::Char(99), Action::Remote),
@@ -252,6 +256,9 @@ mod tests {
     fn no_collisions_and_lookup() {
         let mut seen = std::collections::HashSet::new();
         assert!(BINDINGS.iter().all(|(k, _)| seen.insert(k.code())));
+        #[cfg(windows)]
+        assert_eq!(BINDINGS.len(), 95);
+        #[cfg(not(windows))]
         assert_eq!(BINDINGS.len(), 94);
         assert_eq!(Key::Char(7).name(), "^G");
     }

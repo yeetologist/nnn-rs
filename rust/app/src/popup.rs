@@ -281,7 +281,24 @@ fn printkv(kvarr: &[Kv], f: &mut Vec<u8>) {
 
 /// The `helpstr` part of show_help's text, expanded.
 pub fn expand_helpstr() -> Vec<u8> {
-    let s = HELPSTR.as_bytes();
+    #[cfg(windows)]
+    {
+        let mut f = expand_helpstr_slice(HELPSTR.as_bytes());
+        const NEEDLE: &[u8] = b"Reopen context\n";
+        if let Some(pos) = f.windows(NEEDLE.len()).position(|w| w == NEEDLE) {
+            let at = pos + NEEDLE.len();
+            let extra = expand_helpstr_slice(b"cD  Drives\n");
+            f.splice(at..at, extra);
+        }
+        f
+    }
+    #[cfg(not(windows))]
+    {
+        expand_helpstr_slice(HELPSTR.as_bytes())
+    }
+}
+
+fn expand_helpstr_slice(s: &[u8]) -> Vec<u8> {
     let mut f = Vec::new();
     let mut hex = true;
     let mut i = 0;
@@ -524,8 +541,12 @@ fn float_key(
 
 /// `newwin` returns NULL for a negative position or an empty size; a window that runs off
 /// the screen is created, and only its part on the screen shows.
-fn newwin_fits(h: i32, w: i32, y: i32, x: i32) -> bool {
+pub(crate) fn newwin_fits(h: i32, w: i32, y: i32, x: i32) -> bool {
     y >= 0 && x >= 0 && h > 0 && w > 0
+}
+
+pub(crate) fn win_fits_min(xlines: i32, xcols: i32, min_h: i32, min_w: i32) -> bool {
+    xlines >= min_h && xcols >= min_w
 }
 
 /// The floating window's rows (as `Window::row_text`) after `keys` on an `xlines` x
@@ -1349,6 +1370,8 @@ mod tests {
             lines.last().copied(),
             Some("           ^L  Redraw                  ?  Help, conf")
         );
+        #[cfg(windows)]
+        assert!(lines.contains(&"            D  Drives"));
     }
 
     #[test]

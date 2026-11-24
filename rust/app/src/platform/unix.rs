@@ -414,6 +414,10 @@ pub fn fs_blocks(path: &[u8]) -> Option<FsBlocks> {
     })
 }
 
+pub fn list_drives() -> Vec<super::DriveInfo> {
+    Vec::new()
+}
+
 pub fn toggle_exec(path: &[u8]) -> Option<u32> {
     let fd = rustix::fs::open(&*os(path), OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()).ok()?;
     let sb = rustix::fs::fstat(&fd).ok()?;

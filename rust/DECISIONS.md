@@ -192,3 +192,14 @@ Decision:
 - Read-only files: Rust std's `fs::remove_file` and `fs::remove_dir_all` already delete read-only files on Windows (pinned by unit tests); ADR-026's stale note claiming `rm -rf` failed with "Permission denied" is removed.
 - ADR-024's matrix is amended: duplicate and selection archiving work without Git or Coreutils.
 Consequences: Two new Windows screen cases (`win-duplicate`, `win-archive-sel`, both run with `PATH=C:\Windows\System32` and `NNN_COREUTILS=0`) pin the no-tool paths. Windows screen cases: 42 without Coreutils (4 skipped), 46 with it. Linux stays byte-identical (246/246 bytes, 48/48 tui).
+
+## ADR-030: Windows built-in drive picker (`D`)
+Status: accepted (2026-11-25)
+Context: On Windows, `h`/`Left` stops at the current drive root (`C:/`), matching Unix `nnn` at `/` (ADR-025). Without a drive picker, switching to another drive (`D:/`, USB, mapped share) requires typing a bookmark or shell command.
+Decision:
+- `D` (`Action::Drives`, `#[cfg(windows)]` only) opens a built-in drive picker (`rust/app/src/drives.rs`) while `h`/`Left` at a drive root remains unchanged.
+- `platform::list_drives()` enumerates logical drives (`A:/`..`Z:/`) via `GetLogicalDrives`, `GetDriveTypeW`, `GetVolumeInformationW`, and `GetDiskFreeSpaceExW` inside `platform/windows.rs` (no new crates; `Win32_System_Diagnostics_Debug` and `Win32_System_WindowsProgramming` enabled on `windows-sys`). A `SetThreadErrorMode(SEM_FAILCRITICALERRORS, ...)` RAII guard prevents Windows "Insert a disk" modal dialogs on empty removable/CD-ROM drives. Volume/space queries are skipped for `DRIVE_REMOTE` so disconnected SMB shares never stall the UI.
+- The picker renders a centered bordered floating window (reusing `curses::Window` and `fmt::coolsize`) pre-selecting the current drive, with `j`/`k`/arrows + `Enter`/`l`/`Right`, direct drive-letter jump (`A`–`Z` for any drive, lowercase `a`–`z` for non-vim-nav letters), `q`/`Esc`/`h`/`Left` to cancel, and an automatic single-line status-bar fallback (`drives: C D ... > `) when the terminal is smaller than 7×24. Selecting a drive updates `c_last` via `cdprep`, so `-` returns to the previous directory across drives.
+- `` ` `` (`Action::Cdroot`) now uses `platform::current_root(&path)` (`C:/` or `//server/share/` on Windows, `/` on Unix) instead of hardcoded `/`.
+- `drives.rs` is compiled on every OS so its unit tests run on Linux too; `Action::Drives`, the `D` binding, and the `D  Drives` help line are `#[cfg(windows)]`-gated so Linux stays byte-identical.
+Consequences: One new Windows screen case (`win-drive-picker`) pins `D` → `Esc`, `D` → `c` (`C:/`), and `-` back. Windows screen cases: 43 without Coreutils (4 skipped), 47 with it. Linux stays byte-identical (246/246 bytes, 48/48 tui).
