@@ -493,7 +493,10 @@ impl Window {
                         (i32::from(line[i]), 1)
                     } else {
                         let w = locale::mbstowcs(&line[i..i + len as usize], 1).unwrap_or_default();
-                        (w.first().copied().unwrap_or(i32::from(line[i])), len as usize)
+                        (
+                            w.first().copied().unwrap_or(i32::from(line[i])),
+                            len as usize,
+                        )
                     };
                     i += step;
                     let ch = char::from_u32(c as u32).unwrap_or('?');
